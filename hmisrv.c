@@ -55,6 +55,7 @@ static int serial_fd = -1;
 static int running = 1;
 static pthread_mutex_t serial_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool verbose_mode = false;  // Flag for verbose output
+static int global_brightness = 128; // Default to 50% brightness
 
 // Helper macros for conditional debug output
 #define DEBUG_PRINT(fmt, ...) \
@@ -107,8 +108,9 @@ void handle_key_left(void);
 void handle_key_right(void);
 void handle_key_enter(void);
 void action_brightness(void);
-void update_brightness_display(int brightness);
+//void update_brightness_display(int brightness);
 void brightness_control_loop(void);
+void send_command(const unsigned char *data, size_t length);
 
 // Example menu action functions
 void action_hello(void) {
@@ -121,7 +123,6 @@ void action_hello(void) {
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);  // 30ms delay
     send_draw_text(0, 0, text);
-    printf("Hello action selected\n");
     
     // Wait for user to see result before returning to menu
     sleep(2);
@@ -141,7 +142,7 @@ void action_counter(void) {
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);  // 30ms delay
     send_draw_text(0, 0, text);
-    printf("Counter incremented to %d\n", counter);
+    //printf("Counter incremented to %d\n", counter);
     
     // Wait for user to see result before returning to menu
     sleep(2);
@@ -152,40 +153,36 @@ void action_invert(void) {
     static int inverted = 0;
     inverted = !inverted;
     send_invert(inverted);
-    printf("Display inversion toggled\n");
+    //printf("Display inversion toggled\n");
 }
 
 void action_exit(void) {
     running = 0;
-    printf("Exiting application\n");
+    //printf("Exiting application\n");
 }
 
 // Brightness control action function
 void action_brightness(void) {
-    int brightness = 128; // Start at 50% brightness
-    
     // Initialize and enter the brightness control loop
     brightness_control_loop();
 }
 
-// Function to update the brightness display UI
-void update_brightness_display(int brightness) {
-    char text[64];
+
+// Function to update only the changing parts of the brightness display
+void update_brightness_value(int brightness) {
+    char text[16];
     int percentage = (brightness * 100) / 255;
     
-    // Clear display
-    send_clear();
-    usleep(DISPLAY_CMD_DELAY * 3);
-    
-    // Draw title and percentage
-    //send_draw_text(8, 0, "Brightness Control");
-    send_draw_text(10, 0, "Brightness");
-    
+    // Update just the percentage text
     snprintf(text, sizeof(text), "%d%%", percentage);
-    send_draw_text(50, 15, text);
+    // Clear the previous text area first (draw empty spaces)
+    send_draw_text(50, 20, "    "); // Clear previous value
+    usleep(DISPLAY_CMD_DELAY);
+    // Draw new value
+    send_draw_text(50, 20, text);
+    usleep(DISPLAY_CMD_DELAY);
     
-    // Draw progress bar (x, y, width, height, progress)
-    // Use the progress percentage (0-100)
+    // Update just the progress bar
     unsigned char progress_cmd[6];
     progress_cmd[0] = CMD_PROGRESS_BAR;
     progress_cmd[1] = 10;    // x position
@@ -194,13 +191,10 @@ void update_brightness_display(int brightness) {
     progress_cmd[4] = 15;    // height
     progress_cmd[5] = percentage; // progress (0-100)
     
-    // Send the command to the display
+    // Send the command to update just the progress bar
     send_command(progress_cmd, 6);
     
-    // Display instructions
-    //send_draw_text(15, 50, "Rotate to adjust");
-    
-    // Also set the actual brightness
+    // Set the actual display brightness
     unsigned char brightness_cmd[2];
     brightness_cmd[0] = CMD_BRIGHTNESS;
     brightness_cmd[1] = brightness;
@@ -209,9 +203,20 @@ void update_brightness_display(int brightness) {
     DEBUG_PRINT("Brightness set to %d (%d%%)\n", brightness, percentage);
 }
 
-// The main brightness control loop
+// Initial full screen setup for brightness control
+void setup_brightness_screen(void) {
+    // Clear display
+    send_clear();
+    usleep(DISPLAY_CMD_DELAY * 3);
+    // Draw static elements
+    send_draw_text(25, 5, "Brightness");
+    usleep(DISPLAY_CMD_DELAY);
+    // Display instructions
+    //send_draw_text(15, 50, "Rotate to adjust");
+    usleep(DISPLAY_CMD_DELAY);
+}
+
 void brightness_control_loop(void) {
-    int current_brightness = 128; // Start at 50%
     int running_brightness_menu = 1;
     int pending_update = 1;
     
@@ -230,8 +235,10 @@ void brightness_control_loop(void) {
     
     DEBUG_PRINT("Entering brightness control mode\n");
     
-    // Initial display
-    update_brightness_display(current_brightness);
+    // Setup the initial screen once
+    setup_brightness_screen();
+    // Update the initial brightness values
+    update_brightness_value(global_brightness);//current_brightness);
     
     while (running_brightness_menu && running) {
         // Prepare select
@@ -317,14 +324,12 @@ void brightness_control_loop(void) {
                 if (total_rel_x != 0) {
                     // Left/Right changes brightness
                     if (total_rel_x < 0) {
-                        // Decrease brightness (rotate left)
-                        current_brightness -= 10;
-                        if (current_brightness < 0) current_brightness = 0;
+                        global_brightness -= 10;
+                        if (global_brightness < 0) global_brightness = 0;
                         pending_update = 1;
                     } else if (total_rel_x > 0) {
-                        // Increase brightness (rotate right)
-                        current_brightness += 10;
-                        if (current_brightness > 255) current_brightness = 255;
+                        global_brightness += 10;
+                        if (global_brightness > 255) global_brightness = 255;
                         pending_update = 1;
                     }
                 }
@@ -344,9 +349,9 @@ void brightness_control_loop(void) {
             }
         }
         
-        // Update the display if needed
+        // Update just the brightness value if needed (without clearing the screen)
         if (pending_update) {
-            update_brightness_display(current_brightness);
+            update_brightness_value(global_brightness);//current_brightness);
             pending_update = 0;
         }
 
@@ -357,6 +362,7 @@ void brightness_control_loop(void) {
     // When exiting the brightness menu, update the main menu
     update_menu_display();
 }
+
 
 // Initialize the menu items
 void init_menu(void) {
@@ -808,7 +814,7 @@ int main(int argc, char *argv[]) {
     int paired_event_count = 0;
     int total_rel_x = 0;
 
-while (running) {
+    while (running) {
         // Prepare select
         FD_ZERO(&readfds);
         FD_SET(input_fd, &readfds);
