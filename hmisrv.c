@@ -20,6 +20,9 @@
 #include <ifaddrs.h>
 #include <sys/sysinfo.h>
 #include <netdb.h>  /* For getnameinfo, NI_MAXHOST, NI_NUMERICHOST */
+#include <sys/wait.h>
+#include <time.h>
+
 /* -----------------------------------------------------------------------------
  * Configuration definitions
  * -----------------------------------------------------------------------------*/
@@ -217,9 +220,11 @@ void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len
 //void get_system_info(char *cpu_str, size_t cpu_len, char *mem_str, size_t mem_len);
 void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t mem_total_len,
                     char *mem_free_str, size_t mem_free_len);//)
-void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total_str, 
+void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total_str,
                                size_t mem_total_len, char *mem_free_str, size_t mem_free_len,
                                int *cpu_percentage, int *mem_percentage);
+void action_test_internet(void);
+int ping_server(const char *server, int timeout_sec);
 
 // Menu actions
 void action_hello(void);
@@ -510,7 +515,7 @@ void send_progress_bar(int x, int y, int width, int height, int percentage) {
 
 // Initialize the menu items
 void init_menu(void) {
-    menu_item_count = 7;  // Increased from 5 to 7
+    menu_item_count = 8;
     menu_items = (MenuItem *)malloc(menu_item_count * sizeof(MenuItem));
     if (!menu_items) {
         fprintf(stderr, "Memory allocation failed in init_menu()\n");
@@ -529,16 +534,17 @@ void init_menu(void) {
     menu_items[3].label = "Brightness";
     menu_items[3].action = action_brightness;
 
-    // New menu items
     menu_items[4].label = "Network Settings";
     menu_items[4].action = action_network_settings;
 
     menu_items[5].label = "System Stats";
     menu_items[5].action = action_system_stats;
 
-    // Exit is now item 6 instead of 4
-    menu_items[6].label = "Exit";
-    menu_items[6].action = action_exit;
+    menu_items[6].label = "Test Internet";
+    menu_items[6].action = action_test_internet;
+
+    menu_items[7].label = "Exit";
+    menu_items[7].action = action_exit;
 }
 
 // Clean up menu memory
@@ -598,18 +604,18 @@ void update_selection(int old_selection, int new_selection) {
     if (new_selection >= 0 && new_selection < menu_item_count) {
         char buffer[32];
         int menu_pos = new_selection - display_state.menu_scroll_offset;
-        
+
         // Format with the arrow indicator
         int ret = snprintf(buffer, sizeof(buffer), "> %s", menu_items[new_selection].label);
         if (ret < 0 || ret >= (int)sizeof(buffer)) {
             DEBUG_PRINT("Warning: Buffer truncation in update_selection()\n");
         }
-        
+
         // Calculate y position and draw
         int y_pos = MENU_START_Y + (menu_pos * MENU_ITEM_SPACING);
         send_draw_text(0, y_pos, buffer);
         usleep(DISPLAY_CMD_DELAY);
-        
+
         DEBUG_PRINT("Updating line %d: '%s' at y=%d\n", new_selection + 1, buffer, y_pos);
     }
 }
@@ -657,7 +663,7 @@ void update_menu_display(void) {
         }
     }
 
-    DEBUG_PRINT("Updating display with menu item %d of %d (scroll offset: %d)\n", 
+    DEBUG_PRINT("Updating display with menu item %d of %d (scroll offset: %d)\n",
                 display_state.current_menu_item + 1, menu_item_count, display_state.menu_scroll_offset);
 
     // Clear the display first
@@ -674,12 +680,12 @@ void update_menu_display(void) {
 
     // Now draw visible menu items with proper spacing
     int displayed_items = 0;
-    int max_items_to_display = menu_item_count < MENU_VISIBLE_ITEMS ? 
+    int max_items_to_display = menu_item_count < MENU_VISIBLE_ITEMS ?
                               menu_item_count : MENU_VISIBLE_ITEMS;
 
     for (int i = 0; i < max_items_to_display; i++) {
         int menu_index = i + display_state.menu_scroll_offset;
-        
+
         // Skip if we've gone past the end of the menu
         if (menu_index >= menu_item_count) {
             break;
@@ -693,7 +699,7 @@ void update_menu_display(void) {
         } else {
             ret = snprintf(buffer, sizeof(buffer), "  %s", menu_items[menu_index].label);
         }
-        
+
         if (ret < 0 || ret >= (int)sizeof(buffer)) {
             DEBUG_PRINT("Warning: Buffer truncation in update_menu_display()\n");
         }
@@ -716,7 +722,7 @@ void update_menu_display(void) {
         if (display_state.menu_scroll_offset > 0) {
             send_draw_text(DISPLAY_WIDTH - MENU_SCROLL_INDICATOR_WIDTH, MENU_START_Y, "^");
         }
-        
+
         // Draw down arrow if there are items below
         if (display_state.menu_scroll_offset + MENU_VISIBLE_ITEMS < menu_item_count) {
             int y_pos = MENU_START_Y + ((MENU_VISIBLE_ITEMS - 1) * MENU_ITEM_SPACING);
@@ -845,7 +851,7 @@ void handle_input_events(void) {
     int btn_press = 0;
     bool pending_movement = false;
     struct timeval now;
-    
+
     // Read and coalesce events
     while (read(input_fd, &ev, sizeof(ev)) > 0 && event_count < MAX_EVENTS_PER_ITERATION) {
         // Handle SYN_REPORT events (type 0)
@@ -946,11 +952,11 @@ void update_brightness_value(int brightness) {
     if (ret < 0 || ret >= (int)sizeof(text)) {
         DEBUG_PRINT("Warning: Buffer truncation in update_brightness_value()\n");
     }
-    
+
     // Clear the previous text area first (draw empty spaces)
     send_draw_text(50, 20, "    "); // Clear previous value
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Draw new value
     send_draw_text(50, 20, text);
     usleep(DISPLAY_CMD_DELAY);
@@ -969,7 +975,7 @@ void setup_brightness_screen(void) {
     // Clear display
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    
+
     // Draw static elements
     send_draw_text(25, 5, "Brightness");
     usleep(DISPLAY_CMD_DELAY);
@@ -989,7 +995,7 @@ void brightness_control_loop(void) {
 
     // Setup the initial screen once
     setup_brightness_screen();
-    
+
     // Update the initial brightness values
     update_brightness_value(display_state.brightness);
 
@@ -1135,60 +1141,60 @@ void action_brightness(void) {
 void action_network_settings(void) {
     char ip_str[64] = "Unknown";
     char mac_str[64] = "Unknown";
-    
+
     // Get network information
     get_network_info(ip_str, sizeof(ip_str), mac_str, sizeof(mac_str));
-    
+
     // Clear display and show network info
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    
+
     // Draw the title
     send_draw_text(0, 0, "Network Settings");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Draw a separator
     send_draw_text(0, 8, "----------------");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Format IP with line breaks - first line shows label
     send_draw_text(0, 16, "IP:");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Split IP into 15-char chunks and display on separate lines
     char *ip_ptr = ip_str;
     int y_pos = 24;
     int remaining = strlen(ip_str);
-    
+
     while (remaining > 0) {
         char temp[16] = {0}; // 15 chars + null terminator
         int chunk = remaining > 15 ? 15 : remaining;
-        
+
         strncpy(temp, ip_ptr, chunk);
         temp[chunk] = '\0';
-        
+
         send_draw_text(0, y_pos, temp);
         usleep(DISPLAY_CMD_DELAY);
-        
+
         ip_ptr += chunk;
         remaining -= chunk;
         y_pos += 10;
     }
-    
+
     // Format MAC address - first line shows label
     send_draw_text(0, y_pos, "MAC:");
     usleep(DISPLAY_CMD_DELAY);
     y_pos += 8;
-    
+
     // MAC address (should fit on one line, but just in case)
     send_draw_text(0, y_pos, mac_str);
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Wait for user to press button to return to menu
     int running_network_menu = 1;
-    
+
     DEBUG_PRINT("Displaying network settings...\n");
-    
+
     while (running_network_menu && running) {
         // Prepare select
         fd_set readfds;
@@ -1205,7 +1211,7 @@ void action_network_settings(void) {
 
         if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
             struct input_event ev;
-            
+
             // Read events
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
                 // Check for button press
@@ -1215,11 +1221,11 @@ void action_network_settings(void) {
                 }
             }
         }
-        
+
         // Small delay to reduce CPU usage
         usleep(MAIN_LOOP_DELAY);
     }
-    
+
     // Return to main menu
     update_menu_display();
 }
@@ -1335,59 +1341,59 @@ void action_system_stats(void) {
     char mem_free_str[32] = "Unknown";
     int cpu_percentage = 0;
     int mem_percentage = 0;
-    
+
     // Clear display and show initial system info
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
     send_draw_text(0, 0, "System Stats");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Draw a separator
     send_draw_text(0, 8, "----------------");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     int running_stats_menu = 1;
     struct timeval last_update = {0, 0};
-    
+
     DEBUG_PRINT("Displaying system stats...\n");
-    
+
     // Configure Y positions for the display elements
     const int cpu_label_y = 16;
     const int cpu_bar_y = 25;
     const int mem_label_y = 42;//38;
     const int mem_bar_y = 51;//47;
-    
+
     while (running_stats_menu && running) {
         // Update stats every STAT_UPDATE_SEC seconds
         struct timeval now;
         gettimeofday(&now, NULL);
         long time_diff_sec = (now.tv_sec - last_update.tv_sec);
-        
+
         if (time_diff_sec >= STAT_UPDATE_SEC || last_update.tv_sec == 0) {
             // Get updated system information with percentages
-            get_system_info_with_percent(cpu_str, sizeof(cpu_str), mem_total_str, sizeof(mem_total_str), 
+            get_system_info_with_percent(cpu_str, sizeof(cpu_str), mem_total_str, sizeof(mem_total_str),
                                      mem_free_str, sizeof(mem_free_str), &cpu_percentage, &mem_percentage);
-            
+
             // Update CPU label and value on the same line
             send_draw_text(0, cpu_label_y, "CPU:");
             send_draw_text(40, cpu_label_y, "    ");  // Clear old value
             send_draw_text(40, cpu_label_y, cpu_str);
-            
+
             // CPU progress bar on the next line (full width)
             send_progress_bar(0, cpu_bar_y, 128, 10, cpu_percentage);
-            
+
             // Update Memory label and value on the same line
             send_draw_text(0, mem_label_y, "Memory:");
-            send_draw_text(55, mem_label_y, "    ");  // Clear old value 
+            send_draw_text(55, mem_label_y, "    ");  // Clear old value
             send_draw_text(55, mem_label_y, mem_total_str);
-            
+
             // Memory progress bar on the next line (full width)
             send_progress_bar(0, mem_bar_y, 128, 10, mem_percentage);
-            
+
             // Store current time as last update time
             last_update = now;
         }
-        
+
         // Prepare select
         fd_set readfds;
         struct timeval tv;
@@ -1403,7 +1409,7 @@ void action_system_stats(void) {
 
         if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
             struct input_event ev;
-            
+
             // Read events
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
                 // Check for button press
@@ -1413,16 +1419,16 @@ void action_system_stats(void) {
                 }
             }
         }
-        
+
         // Flush any pending commands
         if (cmd_buffer.used > 0) {
             flush_cmd_buffer();
         }
-        
+
         // Small delay to reduce CPU usage
         usleep(MAIN_LOOP_DELAY);
     }
-    
+
     // Return to main menu
     update_menu_display();
 }
@@ -1430,54 +1436,54 @@ void action_system_stats(void) {
     char cpu_str[16] = "Unknown";
     char mem_total_str[32] = "Unknown";
     char mem_free_str[32] = "Unknown";
-    
+
     // Clear display and show initial system info
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
     send_draw_text(0, 0, "System Stats");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     // Draw a separator
     send_draw_text(0, 8, "----------------");
     usleep(DISPLAY_CMD_DELAY);
-    
+
     int running_stats_menu = 1;
     struct timeval last_update = {0, 0};
-    
+
     DEBUG_PRINT("Displaying system stats...\n");
-    
+
     while (running_stats_menu && running) {
         // Update stats every STAT_UPDATE_SEC seconds
         struct timeval now;
         gettimeofday(&now, NULL);
         long time_diff_sec = (now.tv_sec - last_update.tv_sec);
-        
+
         if (time_diff_sec >= STAT_UPDATE_SEC || last_update.tv_sec == 0) {
             // Get updated system information
-            get_system_info(cpu_str, sizeof(cpu_str), mem_total_str, sizeof(mem_total_str), 
+            get_system_info(cpu_str, sizeof(cpu_str), mem_total_str, sizeof(mem_total_str),
                            mem_free_str, sizeof(mem_free_str));
-            
+
         if (last_update.tv_sec == 0) {
                send_draw_text(0, 16, "CPU-Load:");
                send_draw_text(0, 26, "Mem:");
                send_draw_text(0, 36, "Free:");
           }
-    
+
           // Clear the value areas before writing new values
           send_draw_text(70, 16, "        "); // Clear CPU value area
           send_draw_text(50, 26, "               "); // Clear Memory value area
           send_draw_text(50, 36, "               "); // Clear Free value area
-    
+
            // Small delay to ensure clear takes effect
            usleep(DISPLAY_CMD_DELAY);
-    
+
             // Now update with new values
             send_draw_text(70, 16, cpu_str);
             send_draw_text(50, 26, mem_total_str);
-            send_draw_text(50, 36, mem_free_str);            
+            send_draw_text(50, 36, mem_free_str);
 	    last_update = now;
         }
-        
+
         // Prepare select
         fd_set readfds;
         struct timeval tv;
@@ -1493,7 +1499,7 @@ void action_system_stats(void) {
 
         if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
             struct input_event ev;
-            
+
             // Read events
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
                 // Check for button press
@@ -1503,59 +1509,59 @@ void action_system_stats(void) {
                 }
             }
         }
-        
+
         // Flush any pending commands
         if (cmd_buffer.used > 0) {
             flush_cmd_buffer();
         }
-        
+
         // Small delay to reduce CPU usage
         usleep(MAIN_LOOP_DELAY);
     }
-    
+
     // Return to main menu
     update_menu_display();
 }
 */
 
-void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t mem_total_len, 
+void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t mem_total_len,
                     char *mem_free_str, size_t mem_free_len) {
     // Get CPU usage - this is a simple approximation
     static long prev_idle = 0;
     static long prev_total = 0;
-    
+
     FILE *fp = fopen("/proc/stat", "r");
     if (fp) {
         long user, nice, system, idle, iowait, irq, softirq;
-        
+
         // Read CPU statistics
-        if (fscanf(fp, "cpu %ld %ld %ld %ld %ld %ld %ld", 
+        if (fscanf(fp, "cpu %ld %ld %ld %ld %ld %ld %ld",
                   &user, &nice, &system, &idle, &iowait, &irq, &softirq) == 7) {
-            
+
             long total = user + nice + system + idle + iowait + irq + softirq;
             long total_diff = total - prev_total;
             long idle_diff = idle - prev_idle;
-            
+
             // Calculate CPU usage percentage
             int cpu_usage = 0;
             if (total_diff > 0) {
                 cpu_usage = (int)(100 * (total_diff - idle_diff) / total_diff);
             }
-            
+
             // Update previous values for next calculation
             prev_idle = idle;
             prev_total = total;
-            
+
             snprintf(cpu_str, cpu_len, "%d%%", cpu_usage);
         } else {
             snprintf(cpu_str, cpu_len, "Error");
         }
-        
+
         fclose(fp);
     } else {
         snprintf(cpu_str, cpu_len, "Error");
     }
-    
+
     // Get memory usage
     struct sysinfo info;
     if (sysinfo(&info) == 0) {
@@ -1564,11 +1570,11 @@ void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t 
         long free_ram = info.freeram * info.mem_unit;
         long used_ram = total_ram - free_ram;
         int mem_usage = (int)(100 * used_ram / total_ram);
-        
+
         // Convert to human-readable format (GB)
         float total_gb = (float)total_ram / (1024 * 1024 * 1024);
         float free_gb = (float)free_ram / (1024 * 1024 * 1024);
-        
+
         // Format strings
         snprintf(mem_total_str, mem_total_len, "%.1f GB (%d%%)", total_gb, mem_usage);
         snprintf(mem_free_str, mem_free_len, "%.1f GB (%d%%)", free_gb, 100 - mem_usage);
@@ -1584,41 +1590,41 @@ void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total
     // Get CPU usage - this is a simple approximation
     static long prev_idle = 0;
     static long prev_total = 0;
-    
+
     FILE *fp = fopen("/proc/stat", "r");
     if (fp) {
         long user, nice, system, idle, iowait, irq, softirq;
-        
+
         // Read CPU statistics
-        if (fscanf(fp, "cpu %ld %ld %ld %ld %ld %ld %ld", 
+        if (fscanf(fp, "cpu %ld %ld %ld %ld %ld %ld %ld",
                   &user, &nice, &system, &idle, &iowait, &irq, &softirq) == 7) {
-            
+
             long total = user + nice + system + idle + iowait + irq + softirq;
             long total_diff = total - prev_total;
             long idle_diff = idle - prev_idle;
-            
+
             // Calculate CPU usage percentage
             *cpu_percentage = 0;
             if (total_diff > 0) {
                 *cpu_percentage = (int)(100 * (total_diff - idle_diff) / total_diff);
             }
-            
+
             // Update previous values for next calculation
             prev_idle = idle;
             prev_total = total;
-            
+
             snprintf(cpu_str, cpu_len, "%d%%", *cpu_percentage);
         } else {
             snprintf(cpu_str, cpu_len, "Err");
             *cpu_percentage = 0;
         }
-        
+
         fclose(fp);
     } else {
         snprintf(cpu_str, cpu_len, "Err");
         *cpu_percentage = 0;
     }
-    
+
     // Get memory usage
     struct sysinfo info;
     if (sysinfo(&info) == 0) {
@@ -1627,7 +1633,7 @@ void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total
         long free_ram = info.freeram * info.mem_unit;
         long used_ram = total_ram - free_ram;
         *mem_percentage = (int)(100 * used_ram / total_ram);
-        
+
         // Format strings
         snprintf(mem_total_str, mem_total_len, "%d%%", *mem_percentage);
         snprintf(mem_free_str, mem_free_len, "%d%%", 100 - *mem_percentage);
@@ -1636,6 +1642,160 @@ void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total
         snprintf(mem_free_str, mem_free_len, "Err");
         *mem_percentage = 0;
     }
+}
+
+void action_test_internet(void) {
+    const char *server = "8.8.8.8";  // Google's DNS server
+    const int timeout_sec = 5;        // 5-second timeout
+    int test_result = -1;
+    int progress = 0;
+    bool test_completed = false;
+
+    // Clear display and show initial screen
+    send_clear();
+    usleep(DISPLAY_CMD_DELAY * 3);
+    send_draw_text(0, 0, "Internet Test");
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Draw a separator
+    send_draw_text(0, 8, "----------------");
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Draw the testing message
+    send_draw_text(20, 20, "Testing Internet");
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Initial progress bar (0%)
+    send_progress_bar(10, 35, 108, 15, 0);
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Record start time
+    time_t start_time = time(NULL);
+
+    // Create a child process to perform the ping test to avoid blocking the UI
+    pid_t child_pid = fork();
+
+    if (child_pid == 0) {
+        // This is the child process - do the ping test
+        exit(ping_server(server, timeout_sec));
+    } else if (child_pid < 0) {
+        // Fork failed
+        send_draw_text(25, 50, "Test Error");
+        DEBUG_PRINT("Fork failed: %s\n", strerror(errno));
+        sleep(2);
+        update_menu_display();
+        return;
+    }
+
+    // Parent process continues here to update UI
+    int running_test_menu = 1;
+
+    while (running_test_menu && running) {
+        // Check if test has completed
+        if (!test_completed) {
+            // Check if the child process has finished
+            int status;
+            pid_t result = waitpid(child_pid, &status, WNOHANG);
+
+            if (result == child_pid) {
+                // Child process has finished
+                test_completed = true;
+                if (WIFEXITED(status)) {
+                    test_result = WEXITSTATUS(status);
+                } else {
+                    test_result = -1;  // Abnormal termination
+                }
+
+                // Update progress bar to 100%
+                send_progress_bar(10, 35, 108, 15, 100);
+
+                // Show result message
+                if (test_result == 0) {
+                    send_draw_text(0, 50, "                ");  // Clear line
+                    send_draw_text(30, 50, "Connected!");
+                } else {
+                    send_draw_text(0, 50, "                ");  // Clear line
+                    send_draw_text(20, 50, "No Connection");
+                }
+            } else {
+                // Test still running, update progress bar
+                time_t current_time = time(NULL);
+                time_t elapsed = current_time - start_time;
+
+                // Calculate progress percentage (based on timeout)
+                progress = (elapsed * 100) / timeout_sec;
+                if (progress > 95) progress = 95;  // Cap at 95% until complete
+
+                // Update the progress bar
+                send_progress_bar(10, 35, 108, 15, progress);
+
+                // Add animated dots to the "Testing Internet" message
+                int dots = (elapsed % 4);
+                char message[20];
+                strcpy(message, "Testing Internet");
+                for (int i = 0; i < dots; i++) {
+                    strcat(message, ".");
+                }
+                send_draw_text(0, 20, "                ");  // Clear line
+                send_draw_text(20, 20, message);
+            }
+        }
+
+        // Check for button press to exit
+        fd_set readfds;
+        struct timeval tv;
+        FD_ZERO(&readfds);
+        FD_SET(input_fd, &readfds);
+
+        // Set a short timeout
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms
+
+        int ret = select(input_fd + 1, &readfds, NULL, NULL, &tv);
+
+        if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
+            struct input_event ev;
+
+            while (read(input_fd, &ev, sizeof(ev)) > 0) {
+                if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
+                    running_test_menu = 0;
+                    break;
+                }
+            }
+        }
+
+        // Flush any pending commands
+        if (cmd_buffer.used > 0) {
+            flush_cmd_buffer();
+        }
+
+        // Small delay
+        usleep(MAIN_LOOP_DELAY);
+    }
+
+    // If we exit before test is complete, kill the child process
+    if (!test_completed && child_pid > 0) {
+        kill(child_pid, SIGTERM);
+        waitpid(child_pid, NULL, 0);  // Clean up zombie process
+    }
+
+    // Return to main menu
+    update_menu_display();
+}
+
+/* Function to ping a server and return success (0) or failure (1) */
+int ping_server(const char *server, int timeout_sec) {
+    char command[100];
+
+    // Construct ping command with timeout and minimal output
+    snprintf(command, sizeof(command), "ping -c 1 -W %d %s > /dev/null 2>&1",
+             timeout_sec, server);
+
+    // Execute the command
+    int result = system(command);
+
+    // Return 0 for success, 1 for failure
+    return (result == 0) ? 0 : 1;
 }
 
 /* -----------------------------------------------------------------------------
@@ -1731,7 +1891,7 @@ int main(int argc, char *argv[]) {
 
     // Main event loop
     struct timeval now;
-    
+
     while (running) {
         // Prepare select
         fd_set readfds;
@@ -1762,7 +1922,7 @@ int main(int argc, char *argv[]) {
                 update_menu_display();
             }
         }
-        
+
         // Check if command buffer needs flushing
         gettimeofday(&now, NULL);
         long time_since_flush = get_time_diff_ms(&cmd_buffer.last_flush, &now);
