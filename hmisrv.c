@@ -81,6 +81,7 @@
 
 // Program version
 #define VERSION "1.2.0"
+#define MAX_MENU_ITEMS 10  // Maximum number of menu items we can handle
 
 /* -----------------------------------------------------------------------------
  * Data structures
@@ -126,6 +127,13 @@ typedef struct {
     const char *serial_device;
     bool verbose_mode;
 } Config;
+
+//Define menu item configuration flags
+typedef struct {
+    const char *label;         // Menu item label
+    void (*action)(void);      // Function to call when selected
+    bool enabled;              // Whether this item is enabled
+} MenuItemConfig;
 
 /* -----------------------------------------------------------------------------
  * Global variables
@@ -174,7 +182,6 @@ static SerialCmdBuffer cmd_buffer = {
 // Menu data
 static int menu_item_count = 0;
 static MenuItem *menu_items = NULL;
-
 /* -----------------------------------------------------------------------------
  * Helper macros and function prototypes
  * -----------------------------------------------------------------------------*/
@@ -189,6 +196,10 @@ void init_menu(void);
 void cleanup_menu(void);
 void update_menu_display(void);
 void update_selection(int old_selection, int new_selection);
+void configure_menu_for_minimal();
+void configure_menu_for_full();
+void set_menu_item_enabled(int index, bool enabled);
+void reload_menu(void);
 
 // Input handling
 void handle_key_left(void);
@@ -240,9 +251,42 @@ int open_input_device(const char *device_path);
 int open_serial_device(const char *device_path);
 long get_time_diff_ms(struct timeval *start, struct timeval *end);
 
+static MenuItemConfig menu_item_configs[] = {
+    {"Hello World",      action_hello,          false},  // 0
+    {"Counter",          action_counter,        false},  // 1
+    {"Invert Display",   action_invert,         true},  // 2
+    {"Brightness",       action_brightness,     true},  // 3
+    {"Network Settings", action_network_settings, true},  // 4
+    {"System Stats",     action_system_stats,   true},  // 5
+    {"Test Internet",    action_test_internet,  true},  // 6
+    {"Exit",             action_exit,           true},  // 7
+    // Add new menu items here
+    {NULL, NULL, false}  // End marker, always keep this
+};
+
 /* -----------------------------------------------------------------------------
  * Menu action functions
  * -----------------------------------------------------------------------------*/
+//Example usage - add this function to demonstrate enabling/disabling items
+void configure_menu_for_minimal() {
+    // Example: Configure for minimal mode (only essential items)
+    set_menu_item_enabled(0, false);  // Disable Hello World
+    set_menu_item_enabled(1, false);  // Disable Counter
+    set_menu_item_enabled(3, true);   // Keep Brightness
+    set_menu_item_enabled(6, false);  // Disable Test Internet
+    // Always keep Exit enabled
+    set_menu_item_enabled(7, true);
+    // Reload the menu to apply changes
+    reload_menu();
+}
+
+void configure_menu_for_full() {
+    // Example: Enable all menu items
+    for (int i = 0; menu_item_configs[i].label != NULL; i++)
+        set_menu_item_enabled(i, true);
+    // Reload the menu to apply changes
+    reload_menu();
+}
 
 // Example menu action functions
 void action_hello(void) {
@@ -515,36 +559,55 @@ void send_progress_bar(int x, int y, int width, int height, int percentage) {
 
 // Initialize the menu items
 void init_menu(void) {
-    menu_item_count = 8;
+    /*menu_item_count = 8;
     menu_items = (MenuItem *)malloc(menu_item_count * sizeof(MenuItem));
     if (!menu_items) {
         fprintf(stderr, "Memory allocation failed in init_menu()\n");
         exit(EXIT_FAILURE);
     }
-
     menu_items[0].label = "Hello World";
     menu_items[0].action = action_hello;
-
     menu_items[1].label = "Counter";
     menu_items[1].action = action_counter;
-
     menu_items[2].label = "Invert Display";
     menu_items[2].action = action_invert;
-
     menu_items[3].label = "Brightness";
     menu_items[3].action = action_brightness;
-
     menu_items[4].label = "Network Settings";
     menu_items[4].action = action_network_settings;
-
     menu_items[5].label = "System Stats";
     menu_items[5].action = action_system_stats;
-
     menu_items[6].label = "Test Internet";
     menu_items[6].action = action_test_internet;
-
     menu_items[7].label = "Exit";
-    menu_items[7].action = action_exit;
+    menu_items[7].action = action_exit;*/
+
+    // Count how many menu items are enabled
+    menu_item_count = 0;
+    for (int i = 0; menu_item_configs[i].label != NULL; i++) {
+        if (menu_item_configs[i].enabled) {
+            menu_item_count++;
+        }
+    }
+
+    // Allocate memory for the enabled menu items
+    menu_items = (MenuItem *)malloc(menu_item_count * sizeof(MenuItem));
+
+    if (!menu_items) {
+        fprintf(stderr, "Memory allocation failed in init_menu()\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy only the enabled menu items
+    int menu_index = 0;
+    for (int i = 0; menu_item_configs[i].label != NULL; i++) {
+        if (menu_item_configs[i].enabled) {
+            menu_items[menu_index].label = menu_item_configs[i].label;
+            menu_items[menu_index].action = menu_item_configs[i].action;
+            menu_index++;
+        }
+    }
+    DEBUG_PRINT("Initialized menu with %d items\n", menu_item_count);
 }
 
 // Clean up menu memory
@@ -552,6 +615,42 @@ void cleanup_menu(void) {
     free(menu_items);
     menu_items = NULL;
     menu_item_count = 0;
+}
+
+//function to enable/disable menu items at runtime
+void set_menu_item_enabled(int index, bool enabled) {
+    // Make sure the index is valid
+    int i;
+    for (i = 0; menu_item_configs[i].label != NULL; i++) {
+        if (i == index) {
+            menu_item_configs[i].enabled = enabled;
+            DEBUG_PRINT("Menu item %d (%s) %s\n",
+                      i, menu_item_configs[i].label,
+                      enabled ? "enabled" : "disabled");
+            break;
+        }
+    }
+
+    // If we didn't find the item, print a warning
+    if (menu_item_configs[i].label == NULL) {
+        DEBUG_PRINT("Warning: Tried to set state of invalid menu item %d\n", index);
+    }
+}
+
+//function to reload the menu after changing configuration
+void reload_menu(void) {
+    // Free the old menu items
+    cleanup_menu();
+
+    // Initialize the menu again with the current configuration
+    init_menu();
+
+    // Reset the menu cursor position
+    display_state.current_menu_item = 0;
+    display_state.menu_scroll_offset = 0;
+
+    // Redraw the menu
+    update_menu_display();
 }
 
 // Update just the lines that need to change when selection changes
