@@ -236,12 +236,15 @@ void get_system_info_with_percent(char *cpu_str, size_t cpu_len, char *mem_total
                                int *cpu_percentage, int *mem_percentage);
 void action_test_internet(void);
 int ping_server(const char *server, int timeout_sec);
+void set_wifi_status(int state);
+int get_wifi_status(void);
 
 // Menu actions
 void action_hello(void);
 void action_counter(void);
 void action_invert(void);
 void action_exit(void);
+void action_wifi_menu(void);
 
 // Utility functions
 void print_usage(const char *program_name);
@@ -259,7 +262,8 @@ static MenuItemConfig menu_item_configs[] = {
     {"Network Settings", action_network_settings, true},  // 4
     {"System Stats",     action_system_stats,   true},  // 5
     {"Test Internet",    action_test_internet,  true},  // 6
-    {"Exit",             action_exit,           true},  // 7
+    {"WiFi Settings",    action_wifi_menu,      true},  // 8
+    {"Exit",             action_exit,           true},  // 9
     // Add new menu items here
     {NULL, NULL, false}  // End marker, always keep this
 };
@@ -559,29 +563,6 @@ void send_progress_bar(int x, int y, int width, int height, int percentage) {
 
 // Initialize the menu items
 void init_menu(void) {
-    /*menu_item_count = 8;
-    menu_items = (MenuItem *)malloc(menu_item_count * sizeof(MenuItem));
-    if (!menu_items) {
-        fprintf(stderr, "Memory allocation failed in init_menu()\n");
-        exit(EXIT_FAILURE);
-    }
-    menu_items[0].label = "Hello World";
-    menu_items[0].action = action_hello;
-    menu_items[1].label = "Counter";
-    menu_items[1].action = action_counter;
-    menu_items[2].label = "Invert Display";
-    menu_items[2].action = action_invert;
-    menu_items[3].label = "Brightness";
-    menu_items[3].action = action_brightness;
-    menu_items[4].label = "Network Settings";
-    menu_items[4].action = action_network_settings;
-    menu_items[5].label = "System Stats";
-    menu_items[5].action = action_system_stats;
-    menu_items[6].label = "Test Internet";
-    menu_items[6].action = action_test_internet;
-    menu_items[7].label = "Exit";
-    menu_items[7].action = action_exit;*/
-
     // Count how many menu items are enabled
     menu_item_count = 0;
     for (int i = 0; menu_item_configs[i].label != NULL; i++) {
@@ -1531,97 +1512,6 @@ void action_system_stats(void) {
     // Return to main menu
     update_menu_display();
 }
-/*void action_system_stats(void) {
-    char cpu_str[16] = "Unknown";
-    char mem_total_str[32] = "Unknown";
-    char mem_free_str[32] = "Unknown";
-
-    // Clear display and show initial system info
-    send_clear();
-    usleep(DISPLAY_CMD_DELAY * 3);
-    send_draw_text(0, 0, "System Stats");
-    usleep(DISPLAY_CMD_DELAY);
-
-    // Draw a separator
-    send_draw_text(0, 8, "----------------");
-    usleep(DISPLAY_CMD_DELAY);
-
-    int running_stats_menu = 1;
-    struct timeval last_update = {0, 0};
-
-    DEBUG_PRINT("Displaying system stats...\n");
-
-    while (running_stats_menu && running) {
-        // Update stats every STAT_UPDATE_SEC seconds
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long time_diff_sec = (now.tv_sec - last_update.tv_sec);
-
-        if (time_diff_sec >= STAT_UPDATE_SEC || last_update.tv_sec == 0) {
-            // Get updated system information
-            get_system_info(cpu_str, sizeof(cpu_str), mem_total_str, sizeof(mem_total_str),
-                           mem_free_str, sizeof(mem_free_str));
-
-        if (last_update.tv_sec == 0) {
-               send_draw_text(0, 16, "CPU-Load:");
-               send_draw_text(0, 26, "Mem:");
-               send_draw_text(0, 36, "Free:");
-          }
-
-          // Clear the value areas before writing new values
-          send_draw_text(70, 16, "        "); // Clear CPU value area
-          send_draw_text(50, 26, "               "); // Clear Memory value area
-          send_draw_text(50, 36, "               "); // Clear Free value area
-
-           // Small delay to ensure clear takes effect
-           usleep(DISPLAY_CMD_DELAY);
-
-            // Now update with new values
-            send_draw_text(70, 16, cpu_str);
-            send_draw_text(50, 26, mem_total_str);
-            send_draw_text(50, 36, mem_free_str);
-	    last_update = now;
-        }
-
-        // Prepare select
-        fd_set readfds;
-        struct timeval tv;
-        FD_ZERO(&readfds);
-        FD_SET(input_fd, &readfds);
-
-        // Set a short timeout to allow regular updates
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; // 100ms
-
-        // Wait for events with timeout
-        int ret = select(input_fd + 1, &readfds, NULL, NULL, &tv);
-
-        if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
-            struct input_event ev;
-
-            // Read events
-            while (read(input_fd, &ev, sizeof(ev)) > 0) {
-                // Check for button press
-                if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
-                    running_stats_menu = 0;
-                    break;
-                }
-            }
-        }
-
-        // Flush any pending commands
-        if (cmd_buffer.used > 0) {
-            flush_cmd_buffer();
-        }
-
-        // Small delay to reduce CPU usage
-        usleep(MAIN_LOOP_DELAY);
-    }
-
-    // Return to main menu
-    update_menu_display();
-}
-*/
 
 void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t mem_total_len,
                     char *mem_free_str, size_t mem_free_len) {
@@ -1761,7 +1651,7 @@ void action_test_internet(void) {
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw the testing message
-    send_draw_text(20, 20, "Testing Internet");
+    send_draw_text(20, 20, "Testing");
     usleep(DISPLAY_CMD_DELAY);
 
     // Initial progress bar (0%)
@@ -1831,7 +1721,7 @@ void action_test_internet(void) {
                 // Add animated dots to the "Testing Internet" message
                 int dots = (elapsed % 4);
                 char message[20];
-                strcpy(message, "Testing Internet");
+                strcpy(message, "Testing");
                 for (int i = 0; i < dots; i++) {
                     strcat(message, ".");
                 }
@@ -1886,6 +1776,12 @@ void action_test_internet(void) {
 int ping_server(const char *server, int timeout_sec) {
     char command[100];
 
+    //following sleep is to test progressbar effect
+    //usleep(1000000);
+    //usleep(1000000);
+    //usleep(1000000);
+    //usleep(1000000);
+
     // Construct ping command with timeout and minimal output
     snprintf(command, sizeof(command), "ping -c 1 -W %d %s > /dev/null 2>&1",
              timeout_sec, server);
@@ -1895,6 +1791,303 @@ int ping_server(const char *server, int timeout_sec) {
 
     // Return 0 for success, 1 for failure
     return (result == 0) ? 0 : 1;
+}
+
+int get_wifi_status(void) {
+    static int wifi_state = 0;  // Default to OFF
+    return wifi_state;
+}
+
+// Dummy function to set WiFi status
+void set_wifi_status(int state) {
+    static int wifi_state = 0;  // Internal state
+
+    if (state != wifi_state) {
+        // Only change state if different
+        wifi_state = state;
+        // Log the state change (in real implementation, control WiFi here)
+        DEBUG_PRINT("WiFi state changed to %s\n", state ? "ON" : "OFF");
+        // In a real implementation, you would control the actual WiFi:
+        // Example:
+        // if (state) {
+        //     system("systemctl start wpa_supplicant");
+        // } else {
+        //     system("systemctl stop wpa_supplicant");
+        // }
+    }
+}
+
+// WiFi submenu implementation
+void action_wifi_menu(void) {
+    // WiFi submenu options
+    const char *options[] = {
+        "Turn On",
+        "Turn Off",
+        "Exit"
+    };
+    const int num_options = 3;
+    int selected_option = 0;
+    int current_wifi_state = get_wifi_status();
+
+    // Clear display and show submenu
+    send_clear();
+    usleep(DISPLAY_CMD_DELAY * 3);
+    send_draw_text(0, 0, "WiFi Settings");
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Draw a separator
+    send_draw_text(0, 8, "----------------");
+    usleep(DISPLAY_CMD_DELAY);
+
+    // Draw initial menu options - starting right after the separator with no status line
+    for (int i = 0; i < num_options; i++) {
+        char buffer[32];
+        int y_pos = 16 + (i * 10);  // Start at y=16 with 10px spacing between items
+
+        // Determine if this option represents current state
+        bool is_current_state = (i == 0 && current_wifi_state) ||
+                               (i == 1 && !current_wifi_state);
+
+        // Format with selection indicator and/or inverse highlight
+        if (i == selected_option) {
+            if (is_current_state) {
+                // Draw as inverse (current state and selected)
+                snprintf(buffer, sizeof(buffer), "> [%s]", options[i]);
+            } else {
+                // Selected but not current state
+                snprintf(buffer, sizeof(buffer), "> %s", options[i]);
+            }
+        } else {
+            if (is_current_state) {
+                // Current state but not selected
+                snprintf(buffer, sizeof(buffer), "  [%s]", options[i]);
+            } else {
+                // Neither selected nor current state
+                snprintf(buffer, sizeof(buffer), "  %s", options[i]);
+            }
+        }
+
+        send_draw_text(0, y_pos, buffer);
+        usleep(DISPLAY_CMD_DELAY);
+    }
+
+    // Submenu interaction loop
+    int running_wifi_menu = 1;
+    //struct timeval last_key_time = {0, 0};
+    int paired_event_count = 0;
+    int total_rel_x = 0;
+    bool pending_movement = false;
+    struct timeval last_event_time = {0, 0};
+
+    while (running_wifi_menu && running) {
+        // Prepare select
+        fd_set readfds;
+        struct timeval tv;
+        FD_ZERO(&readfds);
+        FD_SET(input_fd, &readfds);
+
+        // Set a short timeout
+        tv.tv_sec = 0;
+        tv.tv_usec = INPUT_SELECT_TIMEOUT;
+
+        // Wait for events with timeout
+        int ret = select(input_fd + 1, &readfds, NULL, NULL, &tv);
+
+        if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
+            struct input_event ev;
+            int event_count = 0;
+            int btn_press = 0;
+
+            // Read and coalesce events
+            while (read(input_fd, &ev, sizeof(ev)) > 0 && event_count < MAX_EVENTS_PER_ITERATION) {
+                // Handle SYN_REPORT events (type 0)
+                if (ev.type == 0) {
+                    // Skip SYN_REPORT events
+                    continue;
+                }
+
+                // Process based on event type
+                if (ev.type == EV_REL && ev.code == REL_X) {
+                    // Get current time
+                    struct timeval now;
+                    gettimeofday(&now, NULL);
+
+                    // Calculate time diff in milliseconds since last event
+                    long time_diff_ms = 0;
+                    if (last_event_time.tv_sec != 0) {
+                        time_diff_ms = get_time_diff_ms(&last_event_time, &now);
+                    }
+
+                    // Update the last event time
+                    last_event_time = now;
+
+                    // Reset paired count if this is a new movement after a long gap
+                    if (time_diff_ms > 100) {
+                        paired_event_count = 0;
+                        total_rel_x = 0;
+                    }
+
+                    // Always accumulate the value
+                    total_rel_x += ev.value;
+                    paired_event_count++;
+                    pending_movement = true;
+
+                    DEBUG_PRINT("WiFi menu: REL_X event: value=%d, total=%d, paired=%d\n",
+                           ev.value, total_rel_x, paired_event_count);
+
+                    event_count++;
+                }
+                else if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
+                    // Mouse left button press (value 1 = pressed)
+                    btn_press = 1;
+                    event_count++;
+                }
+
+                // Avoid processing too many events at once
+                if (event_count >= MAX_EVENTS_PER_ITERATION) {
+                    break;
+                }
+            }
+
+            // Now we handle the movement only if:
+            // 1. We've received 2 or more events (paired_event_count >= 2), which means we've seen both events from one rotation
+            // 2. OR if it's been more than 30ms since the last event, which means we might not get a paired event
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long time_since_last_ms = get_time_diff_ms(&last_event_time, &now);
+
+            if (pending_movement && (paired_event_count >= 2 || time_since_last_ms > EVENT_PROCESS_THRESHOLD)) {
+                // Only process if we have a non-zero total
+                if (total_rel_x != 0) {
+                    // Remember old selection for redraw
+                    int old_selected = selected_option;
+
+                    // Update selection based on rotation
+                    if (total_rel_x < 0) {
+                        // Move up in the menu
+                        selected_option = (selected_option > 0) ? selected_option - 1 : 0;
+                        DEBUG_PRINT("WiFi menu: Moving UP to option %d\n", selected_option);
+                    } else {
+                        // Move down in the menu
+                        selected_option = (selected_option < num_options - 1) ?
+                                         selected_option + 1 : num_options - 1;
+                        DEBUG_PRINT("WiFi menu: Moving DOWN to option %d\n", selected_option);
+                    }
+
+                    // Only redraw if selection changed
+                    if (old_selected != selected_option) {
+                        // Redraw the changed menu items
+                        for (int i = 0; i < num_options; i++) {
+                            if (i == old_selected || i == selected_option) {
+                                char buffer[32] = {0};  // Initialize to zeros
+                                int y_pos = 16 + (i * 10);
+
+                                // Determine state highlighting
+                                bool is_current_state = (i == 0 && current_wifi_state) ||
+                                                     (i == 1 && !current_wifi_state);
+
+                                // Clear the line first to avoid display artifacts
+                                send_draw_text(0, y_pos, "                    ");
+                                usleep(DISPLAY_CMD_DELAY);
+
+                                // Format with selection indicator and/or inverse highlight
+                                if (i == selected_option) {
+                                    if (is_current_state) {
+                                        snprintf(buffer, sizeof(buffer), "> [%s]", options[i]);
+                                    } else {
+                                        snprintf(buffer, sizeof(buffer), "> %s", options[i]);
+                                    }
+                                } else {
+                                    if (is_current_state) {
+                                        snprintf(buffer, sizeof(buffer), "  [%s]", options[i]);
+                                    } else {
+                                        snprintf(buffer, sizeof(buffer), "  %s", options[i]);
+                                    }
+                                }
+
+                                send_draw_text(0, y_pos, buffer);
+                                usleep(DISPLAY_CMD_DELAY);
+                            }
+                        }
+                    }
+                }
+
+                // Reset tracking variables
+                paired_event_count = 0;
+                total_rel_x = 0;
+                pending_movement = false;
+            }
+
+            // If we processed the maximum events, flush any remaining
+            if (event_count >= MAX_EVENTS_PER_ITERATION) {
+                // Drain input buffer
+                while (read(input_fd, &ev, sizeof(ev)) > 0) {
+                    // Just drain, don't process
+                }
+            }
+
+            if (btn_press) {
+                // Handle button press based on selected option
+                if (selected_option == 2) {
+                    // Exit option selected
+                    running_wifi_menu = 0;  // Exit the submenu
+                } else {
+                    // Try to change WiFi state
+                    int new_state = (selected_option == 0) ? 1 : 0;
+
+                    // Only act if state would change
+                    if (new_state != current_wifi_state) {
+                        // Update the state
+                        set_wifi_status(new_state);
+                        current_wifi_state = new_state;
+
+                        // Redraw all options to update state indicators
+                        for (int i = 0; i < num_options; i++) {
+                            char buffer[32] = {0};  // Initialize to zeros
+                            int y_pos = 16 + (i * 10);
+
+                            // Clear the line first
+                            send_draw_text(0, y_pos, "                    ");
+                            usleep(DISPLAY_CMD_DELAY);
+
+                            // Determine state highlighting
+                            bool is_current_state = (i == 0 && current_wifi_state) ||
+                                                 (i == 1 && !current_wifi_state);
+
+                            // Format with selection indicator and/or inverse highlight
+                            if (i == selected_option) {
+                                if (is_current_state) {
+                                    snprintf(buffer, sizeof(buffer), "> [%s]", options[i]);
+                                } else {
+                                    snprintf(buffer, sizeof(buffer), "> %s", options[i]);
+                                }
+                            } else {
+                                if (is_current_state) {
+                                    snprintf(buffer, sizeof(buffer), "  [%s]", options[i]);
+                                } else {
+                                    snprintf(buffer, sizeof(buffer), "  %s", options[i]);
+                                }
+                            }
+
+                            send_draw_text(0, y_pos, buffer);
+                            usleep(DISPLAY_CMD_DELAY);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Flush any pending commands
+        if (cmd_buffer.used > 0) {
+            flush_cmd_buffer();
+        }
+
+        // Small delay to reduce CPU usage
+        usleep(MAIN_LOOP_DELAY);
+    }
+
+    // Return to main menu
+    update_menu_display();
 }
 
 /* -----------------------------------------------------------------------------
