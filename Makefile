@@ -1,12 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -pthread
+LDFLAGS = -ludev
 TARGET = hmisrv
 SRC = hmisrv.c
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET)

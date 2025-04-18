@@ -22,14 +22,23 @@
 #include <netdb.h>  /* For getnameinfo, NI_MAXHOST, NI_NUMERICHOST */
 #include <sys/wait.h>
 #include <time.h>
-
+#include <libudev.h>
+#include <poll.h>
+#include <sys/stat.h>
 /* -----------------------------------------------------------------------------
  * Configuration definitions
  * -----------------------------------------------------------------------------*/
 
-// Device paths
+// Default Device paths
 #define DEFAULT_INPUT_DEVICE "/dev/input/event0"
 #define DEFAULT_SERIAL_DEVICE "/dev/ttyACM0"
+// For Automatic detection of hid-display-dongle
+#define HMI_VENDOR_ID "1209"
+#define HMI_PRODUCT_ID "0001"
+#define HMI_PRODUCT_NAME "Pico Encoder Display"
+#define HMI_MANUFACTURER "DIY Projects"
+#define DETECTION_POLL_INTERVAL 2000  // Poll every 2 seconds
+#define UDEV_POLL_TIMEOUT 100         // 100ms timeout for udev events
 
 // Protocol commands
 #define CMD_CLEAR 0x01
@@ -179,6 +188,11 @@ static SerialCmdBuffer cmd_buffer = {
     .last_flush = {0, 0}
 };
 
+// global variables for device detection thread
+static pthread_t disconnect_monitor_tid;
+static volatile bool device_disconnected = false;
+static volatile bool monitor_thread_running = false;
+
 // Menu data
 static int menu_item_count = 0;
 static MenuItem *menu_items = NULL;
@@ -191,6 +205,15 @@ static MenuItem *menu_items = NULL;
     do { if (config.verbose_mode) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 
 // Function prototypes
+// Function prototypes for device detection
+void detect_and_run(void);
+char* find_hmi_input_device(void);
+char* find_hmi_serial_device(void);
+bool check_device_present(void);
+bool check_device_connected(void);
+void *disconnection_monitor_thread(void *arg);
+void monitor_device_until_connected(void);
+bool check_device_present_silent(void);
 // Menu functions
 void init_menu(void);
 void cleanup_menu(void);
@@ -463,18 +486,38 @@ void buffer_command(const unsigned char *data, size_t length) {
 // Flush the command buffer to the serial device
 void flush_cmd_buffer(void) {
     pthread_mutex_lock(&serial_mutex);
+
     if (cmd_buffer.used > 0 && serial_fd >= 0) {
         ssize_t bytes_written = write(serial_fd, cmd_buffer.buffer, cmd_buffer.used);
         if (bytes_written < 0) {
             perror("Error writing to serial device");
+
+            // If error indicates device disconnection, set the flag
+            if (errno == EIO || errno == ENODEV || errno == ENXIO) {
+                DEBUG_PRINT("Serial buffer write error indicates device disconnection\n");
+                device_disconnected = true;
+            }
         } else if ((size_t)bytes_written < cmd_buffer.used) {
             fprintf(stderr, "Warning: Only wrote %zd of %zu bytes\n",
                    bytes_written, cmd_buffer.used);
         }
-        // Flush the output
-        tcdrain(serial_fd);
+
+        // Flush the output only if device still connected
+        if (!device_disconnected) {
+            if (tcdrain(serial_fd) < 0) {
+                perror("Error draining serial output");
+
+                // Check if tcdrain error indicates device disconnection
+                if (errno == EIO || errno == ENODEV || errno == ENXIO) {
+                    DEBUG_PRINT("Serial buffer drain error indicates device disconnection\n");
+                    device_disconnected = true;
+                }
+            }
+        }
+
         cmd_buffer.used = 0;
     }
+
     pthread_mutex_unlock(&serial_mutex);
 }
 
@@ -486,12 +529,29 @@ void send_command(const unsigned char *data, size_t length) {
         ssize_t bytes_written = write(serial_fd, data, length);
         if (bytes_written < 0) {
             perror("Error writing to serial device");
+
+            // If error indicates device disconnection, set the flag
+            if (errno == EIO || errno == ENODEV || errno == ENXIO) {
+                DEBUG_PRINT("Serial write error indicates device disconnection\n");
+                device_disconnected = true;
+            }
         } else if ((size_t)bytes_written < length) {
             fprintf(stderr, "Warning: Only wrote %zd of %zu bytes\n", bytes_written, length);
         }
 
         // Flush the output buffer to ensure command is sent immediately
-        tcdrain(serial_fd);
+        // But only if the device hasn't been disconnected
+        if (!device_disconnected) {
+            if (tcdrain(serial_fd) < 0) {
+                perror("Error draining serial output");
+
+                // Check if tcdrain error indicates device disconnection
+                if (errno == EIO || errno == ENODEV || errno == ENXIO) {
+                    DEBUG_PRINT("Serial drain error indicates device disconnection\n");
+                    device_disconnected = true;
+                }
+            }
+        }
     }
     pthread_mutex_unlock(&serial_mutex);
 }
@@ -1080,7 +1140,12 @@ void brightness_control_loop(void) {
     update_brightness_value(display_state.brightness);
 
     while (running_brightness_menu && running) {
-        // Prepare select
+        if (device_disconnected) {
+            DEBUG_PRINT("Device disconnected during WiFi menu\n");
+            running_brightness_menu = 0;
+            break;
+        }
+    	// Prepare select
         fd_set readfds;
         struct timeval tv;
         FD_ZERO(&readfds);
@@ -1276,7 +1341,12 @@ void action_network_settings(void) {
     DEBUG_PRINT("Displaying network settings...\n");
 
     while (running_network_menu && running) {
-        // Prepare select
+        if (device_disconnected) {
+            DEBUG_PRINT("Device disconnected during WiFi menu\n");
+            running_network_menu = 0;
+            break;
+        }
+    	// Prepare select
         fd_set readfds;
         struct timeval tv;
         FD_ZERO(&readfds);
@@ -1444,7 +1514,13 @@ void action_system_stats(void) {
     const int mem_bar_y = 51;//47;
 
     while (running_stats_menu && running) {
-        // Update stats every STAT_UPDATE_SEC seconds
+        // Check if device was disconnected
+        if (device_disconnected) {
+            DEBUG_PRINT("Device disconnected during system stats display\n");
+            running_stats_menu = 0;
+            break;
+        }
+    	// Update stats every STAT_UPDATE_SEC seconds
         struct timeval now;
         gettimeofday(&now, NULL);
         long time_diff_sec = (now.tv_sec - last_update.tv_sec);
@@ -1680,7 +1756,12 @@ void action_test_internet(void) {
     int running_test_menu = 1;
 
     while (running_test_menu && running) {
-        // Check if test has completed
+        if (device_disconnected) {
+            DEBUG_PRINT("Device disconnected during WiFi menu\n");
+            running_test_menu = 0;
+            break;
+        }
+    	// Check if test has completed
         if (!test_completed) {
             // Check if the child process has finished
             int status;
@@ -1880,6 +1961,12 @@ void action_wifi_menu(void) {
     struct timeval last_event_time = {0, 0};
 
     while (running_wifi_menu && running) {
+        // Check if device was disconnected
+        if (device_disconnected) {
+           DEBUG_PRINT("Device disconnected during WiFi menu\n");
+           running_wifi_menu = 0;
+           break;
+        }
         // Prepare select
         fd_set readfds;
         struct timeval tv;
@@ -2090,6 +2177,670 @@ void action_wifi_menu(void) {
     update_menu_display();
 }
 
+/* Update the detect_and_run function to include monitoring */
+void detect_and_run(void) {
+    while (running) {
+        printf("Starting HMI device detection...\n");
+        printf("Looking for: %s by %s (VID:PID %s:%s)\n",
+               HMI_PRODUCT_NAME, HMI_MANUFACTURER, HMI_VENDOR_ID, HMI_PRODUCT_ID);
+
+        // Reset disconnection flag
+        device_disconnected = false;
+
+        // First check if device is already connected
+        if (!check_device_present()) {
+            printf("HMI device not found. Monitoring for device connection...\n");
+            monitor_device_until_connected();
+        }
+
+        // At this point, the device should be connected
+        printf("HMI device detected!\n");
+
+        // Find the correct device files
+        char* input_device = find_hmi_input_device();
+        char* serial_device = find_hmi_serial_device();
+
+        if (!input_device || !serial_device) {
+            fprintf(stderr, "Failed to find all required device files\n");
+            free(input_device);
+            free(serial_device);
+            sleep(2);  // Wait a bit before trying again
+            continue;
+        }
+
+        printf("Found input device: %s\n", input_device);
+        printf("Found serial device: %s\n", serial_device);
+
+        // Update config with found devices
+        config.input_device = input_device;
+        config.serial_device = serial_device;
+
+        // Open devices
+        input_fd = open_input_device(config.input_device);
+        if (input_fd < 0) {
+            free(input_device);
+            free(serial_device);
+            fprintf(stderr, "Failed to open input device\n");
+            sleep(2);  // Wait a bit before trying again
+            continue;
+        }
+
+        serial_fd = open_serial_device(config.serial_device);
+        if (serial_fd < 0) {
+            close(input_fd);
+            free(input_device);
+            free(serial_device);
+            fprintf(stderr, "Failed to open serial device\n");
+            sleep(2);  // Wait a bit before trying again
+            continue;
+        }
+
+        // Initialize the menu
+        init_menu();
+
+        // Initial display with extra delay to make sure device is fully initialized
+        usleep(STARTUP_DELAY); // 1s delay to give the device time to initialize
+        printf("Initializing display...\n");
+
+        // First clear the display
+        send_clear();
+        usleep(DISPLAY_CMD_DELAY * 15); // Very long delay after initial clear (150ms)
+
+        // Draw a startup message (one line at a time with long delays)
+        send_draw_text(0, 0, "Menu System");
+        usleep(DISPLAY_CMD_DELAY * 10); // 100ms delay
+
+        // Send one command at a time with long delays
+        send_draw_text(0, 10, "Initializing...");
+        usleep(DISPLAY_CMD_DELAY * 10); // 100ms delay
+
+        // One more clear before showing the menu
+        send_clear();
+        usleep(DISPLAY_CMD_DELAY * 15); // 150ms delay
+
+        // Now draw the menu
+        update_menu_display();
+
+        // Initialize timeval for key handling
+        gettimeofday(&input_state.last_key_time, NULL);
+        gettimeofday(&display_state.last_update_time, NULL);
+        gettimeofday(&cmd_buffer.last_flush, NULL);
+
+        // Start the disconnection monitor thread
+        monitor_thread_running = true;
+        pthread_create(&disconnect_monitor_tid, NULL, disconnection_monitor_thread, NULL);
+
+        // Main event loop
+        struct timeval now;
+        bool local_running = true;
+
+        while (local_running && running) {
+            // Check if device was disconnected
+            if (device_disconnected) {
+                printf("Device disconnection detected! Returning to detection mode...\n");
+                local_running = false;
+                break;
+            }
+
+            // Prepare select
+            fd_set readfds;
+            struct timeval tv;
+            FD_ZERO(&readfds);
+            FD_SET(input_fd, &readfds);
+
+            // Set a short timeout
+            tv.tv_sec = 0;
+            tv.tv_usec = INPUT_SELECT_TIMEOUT; // 20ms timeout
+
+            // Wait for events with timeout
+            int ret = select(input_fd + 1, &readfds, NULL, NULL, &tv);
+
+            // Check for select errors which might indicate device disconnection
+            if (ret < 0 && errno != EINTR) {
+                printf("Select error: %s - device may be disconnected\n", strerror(errno));
+                local_running = false;
+                break;
+            }
+
+            if (ret > 0 && FD_ISSET(input_fd, &readfds)) {
+                // Try to handle input - if device is gone, read will fail
+                //struct input_event ev;
+                //if (read(input_fd, &ev, sizeof(ev)) <= 0 && errno != EAGAIN) {
+                //    printf("Input device read error: %s - device disconnected\n", strerror(errno));
+                //    local_running = false;
+                //    break;
+                //}
+
+                // If read succeeded, process the event
+                handle_input_events();
+            }
+
+            // Process pending display updates if needed
+            if (display_state.needs_update && !display_state.update_in_progress) {
+                gettimeofday(&now, NULL);
+
+                // Calculate time diff in milliseconds
+                long time_diff_ms = get_time_diff_ms(&display_state.last_update_time, &now);
+
+                // Only update if enough time has passed
+                if (time_diff_ms > DISPLAY_UPDATE_DEBOUNCE) {
+                    update_menu_display();
+                }
+            }
+
+            // Check if command buffer needs flushing
+            gettimeofday(&now, NULL);
+            long time_since_flush = get_time_diff_ms(&cmd_buffer.last_flush, &now);
+            if (time_since_flush > CMD_BUFFER_FLUSH_INTERVAL && cmd_buffer.used > 0) {
+                flush_cmd_buffer();
+            }
+
+            // Small delay to reduce CPU usage
+            usleep(MAIN_LOOP_DELAY); // 5ms
+        }
+
+        // Stop the monitor thread
+        monitor_thread_running = false;
+        pthread_join(disconnect_monitor_tid, NULL);
+
+        // Clean up before restarting
+        send_clear();
+        usleep(DISPLAY_CMD_DELAY);
+        send_draw_text(0, 0, "Device disconnected");
+        usleep(DISPLAY_CMD_DELAY * 10);
+
+        cleanup_menu();
+
+        if (input_fd >= 0) {
+            close(input_fd);
+            input_fd = -1;
+        }
+
+        if (serial_fd >= 0) {
+            close(serial_fd);
+            serial_fd = -1;
+        }
+
+        // Free allocated memory
+        free(input_device);
+        free(serial_device);
+
+        // Wait a moment before restarting detection
+        sleep(1);
+    }
+
+    // Final cleanup
+    pthread_mutex_destroy(&serial_mutex);
+}
+
+/* Check if the HMI device is already connected */
+bool check_device_present(void) {
+    struct udev *udev;
+    struct udev_enumerate *enumerate;
+    struct udev_list_entry *devices, *dev_list_entry;
+    bool found = false;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        fprintf(stderr, "Failed to create udev context\n");
+        return false;
+    }
+
+    // Create enumerate object
+    enumerate = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(enumerate, "usb");
+    udev_enumerate_scan_devices(enumerate);
+
+    // Get the list of matching devices
+    devices = udev_enumerate_get_list_entry(enumerate);
+
+    // Iterate through devices
+    udev_list_entry_foreach(dev_list_entry, devices) {
+        const char *path = udev_list_entry_get_name(dev_list_entry);
+        struct udev_device *dev = udev_device_new_from_syspath(udev, path);
+
+        if (dev) {
+            const char *vendor = udev_device_get_sysattr_value(dev, "idVendor");
+            const char *product = udev_device_get_sysattr_value(dev, "idProduct");
+            const char *manufacturer = udev_device_get_sysattr_value(dev, "manufacturer");
+            const char *product_name = udev_device_get_sysattr_value(dev, "product");
+
+            // Check if this is our HMI device
+            if (vendor && product &&
+                strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                if (manufacturer && product_name &&
+                    strstr(manufacturer, HMI_MANUFACTURER) != NULL &&
+                    strstr(product_name, HMI_PRODUCT_NAME) != NULL) {
+
+                    printf("Found device: %s %s (VID:PID %s:%s)\n",
+                           manufacturer, product_name, vendor, product);
+                    found = true;
+                }
+            }
+
+            udev_device_unref(dev);
+
+            if (found) break;
+        }
+    }
+
+    // Clean up
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+
+    return found;
+}
+
+/* Monitor for device connection */
+void monitor_device_until_connected(void) {
+    struct udev *udev;
+    struct udev_monitor *mon;
+    int fd;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        fprintf(stderr, "Failed to create udev context\n");
+        return;
+    }
+
+    // Set up monitoring
+    mon = udev_monitor_new_from_netlink(udev, "udev");
+    udev_monitor_filter_add_match_subsystem_devtype(mon, "usb", NULL);
+    udev_monitor_enable_receiving(mon);
+    fd = udev_monitor_get_fd(mon);
+
+    // Set up polling
+    struct pollfd fds[1];
+    fds[0].fd = fd;
+    fds[0].events = POLLIN;
+
+    printf("Waiting for HMI device to be connected...\n");
+
+    while (1) {
+        // First check if device is already present
+        if (check_device_present()) {
+            printf("HMI device found!\n");
+            break;
+        }
+
+        // Wait for device events
+        int ret = poll(fds, 1, UDEV_POLL_TIMEOUT);
+
+        if (ret > 0 && (fds[0].revents & POLLIN)) {
+            // Get the device
+            struct udev_device *dev = udev_monitor_receive_device(mon);
+            if (dev) {
+                const char *action = udev_device_get_action(dev);
+
+                // Only care about add events
+                if (action && strcmp(action, "add") == 0) {
+                    // Check if this is potentially our device
+                    struct udev_device *usb_dev = udev_device_get_parent_with_subsystem_devtype(
+                        dev, "usb", "usb_device");
+
+                    if (usb_dev) {
+                        const char *vendor = udev_device_get_sysattr_value(usb_dev, "idVendor");
+                        const char *product = udev_device_get_sysattr_value(usb_dev, "idProduct");
+
+                        if (vendor && product &&
+                            strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                            strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                            printf("USB device connected (VID:PID %s:%s)\n", vendor, product);
+
+                            // Give some time for all device nodes to be created
+                            sleep(2);
+
+                            // Double check that all required interfaces are present
+                            if (check_device_present()) {
+                                printf("HMI device fully initialized!\n");
+                                udev_device_unref(dev);
+                                break;
+                            }
+                        }
+                    }
+                }
+                udev_device_unref(dev);
+            }
+        }
+
+        // Brief delay before checking again if no events
+        if (ret == 0) {
+            usleep(DETECTION_POLL_INTERVAL * 1000);
+        }
+    }
+
+    // Clean up
+    udev_monitor_unref(mon);
+    udev_unref(udev);
+}
+
+/* Find the input event device for our HMI */
+char* find_hmi_input_device(void) {
+    struct udev *udev;
+    struct udev_enumerate *enumerate;
+    struct udev_list_entry *devices, *dev_list_entry;
+    char *result = NULL;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        return NULL;
+    }
+
+    // Create enumerate object for input devices
+    enumerate = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(enumerate, "input");
+    udev_enumerate_scan_devices(enumerate);
+
+    // Get the list of input devices
+    devices = udev_enumerate_get_list_entry(enumerate);
+
+    // Iterate through input devices
+    udev_list_entry_foreach(dev_list_entry, devices) {
+        const char *path = udev_list_entry_get_name(dev_list_entry);
+        struct udev_device *dev = udev_device_new_from_syspath(udev, path);
+
+        if (dev) {
+            const char *devnode = udev_device_get_devnode(dev);
+
+            // Only interested in event devices
+            if (devnode && strstr(devnode, "/dev/input/event") != NULL) {
+                // Get the parent USB device
+                struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
+                    dev, "usb", "usb_interface");
+
+                if (parent) {
+                    // Get the parent of the interface to reach the USB device itself
+                    struct udev_device *usb_dev = udev_device_get_parent_with_subsystem_devtype(
+                        parent, "usb", "usb_device");
+
+                    if (usb_dev) {
+                        const char *vendor = udev_device_get_sysattr_value(usb_dev, "idVendor");
+                        const char *product = udev_device_get_sysattr_value(usb_dev, "idProduct");
+                        const char *manufacturer = udev_device_get_sysattr_value(usb_dev, "manufacturer");
+                        const char *product_name = udev_device_get_sysattr_value(usb_dev, "product");
+
+                        // Check if this is our HMI device
+                        if (vendor && product &&
+                            strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                            strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                            if (manufacturer && product_name &&
+                                strstr(manufacturer, HMI_MANUFACTURER) != NULL &&
+                                strstr(product_name, HMI_PRODUCT_NAME) != NULL) {
+
+                                // This is our device, save the event device path
+                                result = strdup(devnode);
+                                udev_device_unref(dev);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            udev_device_unref(dev);
+        }
+    }
+
+    // Clean up
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+
+    return result;
+}
+
+/* Find the serial device for our HMI */
+char* find_hmi_serial_device(void) {
+    struct udev *udev;
+    struct udev_enumerate *enumerate;
+    struct udev_list_entry *devices, *dev_list_entry;
+    char *result = NULL;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        return NULL;
+    }
+
+    // Create enumerate object for tty devices
+    enumerate = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(enumerate, "tty");
+    udev_enumerate_scan_devices(enumerate);
+
+    // Get the list of tty devices
+    devices = udev_enumerate_get_list_entry(enumerate);
+
+    // Iterate through tty devices
+    udev_list_entry_foreach(dev_list_entry, devices) {
+        const char *path = udev_list_entry_get_name(dev_list_entry);
+        struct udev_device *dev = udev_device_new_from_syspath(udev, path);
+
+        if (dev) {
+            const char *devnode = udev_device_get_devnode(dev);
+
+            // Only interested in ACM devices (likely to be our serial interface)
+            if (devnode && strstr(devnode, "/dev/ttyACM") != NULL) {
+                // Get the parent USB device
+                struct udev_device *parent = udev_device_get_parent_with_subsystem_devtype(
+                    dev, "usb", "usb_interface");
+
+                if (parent) {
+                    // Get the parent of the interface to reach the USB device itself
+                    struct udev_device *usb_dev = udev_device_get_parent_with_subsystem_devtype(
+                        parent, "usb", "usb_device");
+
+                    if (usb_dev) {
+                        const char *vendor = udev_device_get_sysattr_value(usb_dev, "idVendor");
+                        const char *product = udev_device_get_sysattr_value(usb_dev, "idProduct");
+                        const char *manufacturer = udev_device_get_sysattr_value(usb_dev, "manufacturer");
+                        const char *product_name = udev_device_get_sysattr_value(usb_dev, "product");
+
+                        // Check if this is our HMI device
+                        if (vendor && product &&
+                            strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                            strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                            if (manufacturer && product_name &&
+                                strstr(manufacturer, HMI_MANUFACTURER) != NULL &&
+                                strstr(product_name, HMI_PRODUCT_NAME) != NULL) {
+
+                                // This is our device, save the tty device path
+                                result = strdup(devnode);
+                                udev_device_unref(dev);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            udev_device_unref(dev);
+        }
+    }
+
+    // Clean up
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+
+    return result;
+}
+
+/* Device disconnection monitor thread function */
+void *disconnection_monitor_thread(void *arg) {
+    (void)arg; // Unused parameter
+
+    struct udev *udev;
+    struct udev_monitor *mon;
+    int fd;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        fprintf(stderr, "Failed to create udev context in monitor thread\n");
+        return NULL;
+    }
+
+    // Set up monitoring
+    mon = udev_monitor_new_from_netlink(udev, "udev");
+    udev_monitor_filter_add_match_subsystem_devtype(mon, "usb", NULL);
+    udev_monitor_enable_receiving(mon);
+    fd = udev_monitor_get_fd(mon);
+
+    // Set up polling
+    struct pollfd fds[1];
+    fds[0].fd = fd;
+    fds[0].events = POLLIN;
+
+    DEBUG_PRINT("Disconnection monitor thread started\n");
+
+    // Track time for periodic checks
+    time_t last_check_time = time(NULL);
+
+    while (monitor_thread_running) {
+        // Only check device connection periodically (every 5 seconds)
+        time_t now = time(NULL);
+        if (now - last_check_time >= 5) {
+            // Check that the device is still present
+            if (!check_device_connected()) {
+                DEBUG_PRINT("Device disconnected (periodic check)\n");
+                device_disconnected = true;
+                break;
+            }
+            last_check_time = now;
+        }
+
+        // Poll for device events (focusing on removal events)
+        int ret = poll(fds, 1, 1000); // 1 second timeout
+
+        if (ret > 0 && (fds[0].revents & POLLIN)) {
+            // Get the device
+            struct udev_device *dev = udev_monitor_receive_device(mon);
+            if (dev) {
+                const char *action = udev_device_get_action(dev);
+
+                // Only process remove events to avoid repeated detection
+                if (action && strcmp(action, "remove") == 0) {
+                    // Check if this is potentially our device
+                    struct udev_device *usb_dev = udev_device_get_parent_with_subsystem_devtype(
+                        dev, "usb", "usb_device");
+
+                    if (usb_dev) {
+                        const char *vendor = udev_device_get_sysattr_value(usb_dev, "idVendor");
+                        const char *product = udev_device_get_sysattr_value(usb_dev, "idProduct");
+
+                        if (vendor && product &&
+                            strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                            strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                            DEBUG_PRINT("USB device disconnected (VID:PID %s:%s)\n", vendor, product);
+                            device_disconnected = true;
+                            udev_device_unref(dev);
+                            break;
+                        }
+                    }
+                }
+                udev_device_unref(dev);
+            }
+        }
+    }
+
+    // Clean up
+    udev_monitor_unref(mon);
+    udev_unref(udev);
+
+    DEBUG_PRINT("Disconnection monitor thread exiting\n");
+    return NULL;
+}
+
+/* Check if the device is still connected (file handle check) */
+bool check_device_connected(void) {
+    // First, check if our file descriptors are still valid
+    if (input_fd < 0 || serial_fd < 0) {
+        return false;
+    }
+
+    // Try to check if the device nodes still exist
+    struct stat input_stat, serial_stat;
+    if (fstat(input_fd, &input_stat) < 0 || fstat(serial_fd, &serial_stat) < 0) {
+        DEBUG_PRINT("Device file stats check failed\n");
+        return false;
+    }
+
+    // IMPORTANT: Only check the device via udev occasionally, not on every call
+    static time_t last_udev_check = 0;
+    time_t now = time(NULL);
+
+    // Only perform the expensive udev check once every 5 seconds
+    if (now - last_udev_check > 5) {
+        last_udev_check = now;
+
+        // Check the actual devices via udev (but less frequently)
+        bool device_present = check_device_present_silent();
+        if (!device_present) {
+            DEBUG_PRINT("Device not found in USB device list\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+/* silent version of the device present check that doesn't print */
+bool check_device_present_silent(void) {
+    struct udev *udev;
+    struct udev_enumerate *enumerate;
+    struct udev_list_entry *devices, *dev_list_entry;
+    bool found = false;
+
+    // Create udev context
+    udev = udev_new();
+    if (!udev) {
+        return false;
+    }
+
+    // Create enumerate object
+    enumerate = udev_enumerate_new(udev);
+    udev_enumerate_add_match_subsystem(enumerate, "usb");
+    udev_enumerate_scan_devices(enumerate);
+
+    // Get the list of matching devices
+    devices = udev_enumerate_get_list_entry(enumerate);
+
+    // Iterate through devices
+    udev_list_entry_foreach(dev_list_entry, devices) {
+        const char *path = udev_list_entry_get_name(dev_list_entry);
+        struct udev_device *dev = udev_device_new_from_syspath(udev, path);
+
+        if (dev) {
+            const char *vendor = udev_device_get_sysattr_value(dev, "idVendor");
+            const char *product = udev_device_get_sysattr_value(dev, "idProduct");
+
+            // Check if this is our HMI device
+            if (vendor && product &&
+                strcmp(vendor, HMI_VENDOR_ID) == 0 &&
+                strcmp(product, HMI_PRODUCT_ID) == 0) {
+
+                found = true;
+            }
+
+            udev_device_unref(dev);
+
+            if (found) break;
+        }
+    }
+
+    // Clean up
+    udev_enumerate_unref(enumerate);
+    udev_unref(udev);
+
+    return found;
+}
+
 /* -----------------------------------------------------------------------------
  * Main function
  * -----------------------------------------------------------------------------*/
@@ -2104,7 +2855,7 @@ int main(int argc, char *argv[]) {
     bool args_provided = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:s:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "i:s:vah")) != -1) {
         switch (opt) {
             case 'i':
                 config.input_device = optarg;
@@ -2117,7 +2868,12 @@ int main(int argc, char *argv[]) {
             case 'v':
                 config.verbose_mode = true;
                 break;
-            case 'h':
+            case 'a':
+                // Auto-detect mode (will be used even if no args provided)
+                printf("Auto-detection mode enabled\n");
+                detect_and_run();
+                return EXIT_SUCCESS;
+	    case 'h':
                 print_usage(argv[0]);
                 return EXIT_SUCCESS;
             default:
@@ -2128,8 +2884,9 @@ int main(int argc, char *argv[]) {
 
     // Check if no arguments were provided, show help in that case
     if (argc == 1 || !args_provided) {
-        print_usage(argv[0]);
-        return EXIT_SUCCESS;
+        //print_usage(argv[0]);
+        detect_and_run();
+	return EXIT_SUCCESS;
     }
 
     printf("Using input device: %s\n", config.input_device);
