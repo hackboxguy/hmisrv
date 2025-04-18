@@ -81,6 +81,10 @@
 #define STARTUP_DELAY 1000000 // 1s delay at startup
 #define CMD_BUFFER_FLUSH_INTERVAL 50 // 50ms between buffer flushes
 
+// power save constants
+#define POWER_SAVE_TIMEOUT_SEC 10  // Default timeout in seconds before entering power save mode
+#define CMD_POWER_MODE 0x07        // Command byte for power mode control
+
 // Input event handling limits
 #define MAX_EVENTS_PER_ITERATION 5
 #define MAX_ACCELERATION_STEPS 3
@@ -196,6 +200,15 @@ static volatile bool monitor_thread_running = false;
 // Menu data
 static int menu_item_count = 0;
 static MenuItem *menu_items = NULL;
+
+// display power save variables
+static bool power_save_enabled = false;      // Whether power save mode is enabled
+static bool display_powered_on = true;       // Current display power state
+static struct timeval last_activity_time;    // Time of last user activity
+static void (*current_submenu_function)(void) = NULL;
+static volatile bool exit_current_submenu = false;
+static volatile bool power_save_activated = false;
+
 /* -----------------------------------------------------------------------------
  * Helper macros and function prototypes
  * -----------------------------------------------------------------------------*/
@@ -250,7 +263,8 @@ void brightness_control_loop(void);
 // Network and system stats
 void action_network_settings(void);
 void action_system_stats(void);
-void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len);
+void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len,char* ifname,
+		size_t if_len);
 //void get_system_info(char *cpu_str, size_t cpu_len, char *mem_str, size_t mem_len);
 void get_system_info(char *cpu_str, size_t cpu_len, char *mem_total_str, size_t mem_total_len,
                     char *mem_free_str, size_t mem_free_len);//)
@@ -277,12 +291,18 @@ int open_input_device(const char *device_path);
 int open_serial_device(const char *device_path);
 long get_time_diff_ms(struct timeval *start, struct timeval *end);
 
+//power save functions
+void set_display_power(bool power_on);
+void update_activity_timestamp(void);
+void check_power_save_timeout(void);
+void check_power_save_and_signal_exit(void);
+
 static MenuItemConfig menu_item_configs[] = {
     {"Hello World",      action_hello,          false},  // 0
     {"Counter",          action_counter,        false},  // 1
     {"Invert Display",   action_invert,         true},  // 2
     {"Brightness",       action_brightness,     true},  // 3
-    {"Network Settings", action_network_settings, true},  // 4
+    {"Net Settings",     action_network_settings, true},  // 4
     {"System Stats",     action_system_stats,   true},  // 5
     {"Test Internet",    action_test_internet,  true},  // 6
     {"WiFi Settings",    action_wifi_menu,      true},  // 8
@@ -377,6 +397,8 @@ void print_usage(const char *program_name) {
     printf("Options:\n");
     printf("  -i DEVICE   Specify input device (default: %s)\n", DEFAULT_INPUT_DEVICE);
     printf("  -s DEVICE   Specify serial device for display (default: %s)\n", DEFAULT_SERIAL_DEVICE);
+    printf("  -a          Auto-detect HMI device (overrides -i and -s)\n");
+    printf("  -p          Enable power save mode (display turns off after %d seconds of inactivity)\n", POWER_SAVE_TIMEOUT_SEC);
     printf("  -v          Enable verbose debug output\n");
     printf("  -h          Display this help message\n\n");
     printf("Example:\n");
@@ -892,6 +914,7 @@ void update_menu_display(void) {
 
 // Handle key press events with acceleration
 void handle_key_left(void) {
+    update_activity_timestamp();
     struct timeval now;
     gettimeofday(&now, NULL);
 
@@ -934,6 +957,7 @@ void handle_key_left(void) {
 }
 
 void handle_key_right(void) {
+    update_activity_timestamp();
     struct timeval now;
     gettimeofday(&now, NULL);
 
@@ -975,17 +999,37 @@ void handle_key_right(void) {
     DEBUG_PRINT("RIGHT key pressed (steps: %d)\n", steps);
 }
 
-void handle_key_enter(void) {
+/*void handle_key_enter(void) {
+    update_activity_timestamp();
     DEBUG_PRINT("ENTER key pressed\n");
     if (display_state.current_menu_item >= 0 && display_state.current_menu_item < menu_item_count) {
         if (menu_items[display_state.current_menu_item].action) {
             menu_items[display_state.current_menu_item].action();
         }
     }
-}
+}*/
+void handle_key_enter(void) {
+    update_activity_timestamp();
+    DEBUG_PRINT("ENTER key pressed\n");
 
+    if (display_state.current_menu_item >= 0 && display_state.current_menu_item < menu_item_count) {
+        if (menu_items[display_state.current_menu_item].action) {
+            // Set the current submenu function
+            current_submenu_function = menu_items[display_state.current_menu_item].action;
+            exit_current_submenu = false;
+
+            // Execute the function
+            current_submenu_function();
+
+            // Reset when done
+            current_submenu_function = NULL;
+        }
+    }
+}
 // Handle all input events
 void handle_input_events(void) {
+    //handle power save timeout
+    update_activity_timestamp();
     struct input_event ev;
     int event_count = 0;
     int btn_press = 0;
@@ -1140,12 +1184,21 @@ void brightness_control_loop(void) {
     update_brightness_value(display_state.brightness);
 
     while (running_brightness_menu && running) {
-        if (device_disconnected) {
+        // Check for power save mode activation
+        if (power_save_enabled) {
+            check_power_save_timeout();
+            if (!display_powered_on || power_save_activated) {
+                DEBUG_PRINT("Power save detected- exiting\n");
+                running_brightness_menu = 0;
+                break;
+            }
+        }
+    if (device_disconnected) {
             DEBUG_PRINT("Device disconnected during WiFi menu\n");
             running_brightness_menu = 0;
             break;
         }
-    	// Prepare select
+        // Prepare select
         fd_set readfds;
         struct timeval tv;
         FD_ZERO(&readfds);
@@ -1215,6 +1268,7 @@ void brightness_control_loop(void) {
 
             // Process button press if detected
             if (btn_press) {
+                update_activity_timestamp();
                 DEBUG_PRINT("Button pressed, exiting brightness control\n");
                 running_brightness_menu = 0;
             }
@@ -1224,6 +1278,7 @@ void brightness_control_loop(void) {
             long time_since_last_ms = get_time_diff_ms(&input_state.last_event_time, &now);
 
             if (pending_movement && (input_state.paired_event_count >= 2 || time_since_last_ms > EVENT_PROCESS_THRESHOLD)) {
+        update_activity_timestamp();
                 // Only process if we have a non-zero total
                 if (input_state.total_rel_x != 0) {
                     // Left/Right changes brightness
@@ -1286,16 +1341,18 @@ void action_brightness(void) {
 void action_network_settings(void) {
     char ip_str[64] = "Unknown";
     char mac_str[64] = "Unknown";
+    char ifname_str[64] = "Unknown";
+    char temp_str[128] = "Unknown";
 
     // Get network information
-    get_network_info(ip_str, sizeof(ip_str), mac_str, sizeof(mac_str));
+    get_network_info(ip_str, sizeof(ip_str), mac_str, sizeof(mac_str),ifname_str,sizeof(ifname_str));
 
     // Clear display and show network info
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
 
     // Draw the title
-    send_draw_text(0, 0, "Network Settings");
+    send_draw_text(0, 0, "Network Setting");
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw a separator
@@ -1303,7 +1360,9 @@ void action_network_settings(void) {
     usleep(DISPLAY_CMD_DELAY);
 
     // Format IP with line breaks - first line shows label
-    send_draw_text(0, 16, "IP:");
+    snprintf(temp_str,sizeof(temp_str),"IP:%s",ifname_str);
+    send_draw_text(0, 16, temp_str);
+    //send_draw_text(0, 16, "IP:");
     usleep(DISPLAY_CMD_DELAY);
 
     // Split IP into 15-char chunks and display on separate lines
@@ -1325,7 +1384,7 @@ void action_network_settings(void) {
         remaining -= chunk;
         y_pos += 10;
     }
-
+    y_pos+=8;
     // Format MAC address - first line shows label
     send_draw_text(0, y_pos, "MAC:");
     usleep(DISPLAY_CMD_DELAY);
@@ -1341,12 +1400,21 @@ void action_network_settings(void) {
     DEBUG_PRINT("Displaying network settings...\n");
 
     while (running_network_menu && running) {
-        if (device_disconnected) {
+        // Check for power save mode activation
+        if (power_save_enabled) {
+            check_power_save_timeout();
+            if (!display_powered_on || power_save_activated) {
+                DEBUG_PRINT("Power save detected - exiting\n");
+                running_network_menu = 0;
+                break;
+            }
+        }
+    if (device_disconnected) {
             DEBUG_PRINT("Device disconnected during WiFi menu\n");
             running_network_menu = 0;
             break;
         }
-    	// Prepare select
+        // Prepare select
         fd_set readfds;
         struct timeval tv;
         FD_ZERO(&readfds);
@@ -1364,7 +1432,8 @@ void action_network_settings(void) {
 
             // Read events
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
-                // Check for button press
+            update_activity_timestamp();
+            // Check for button press
                 if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
                     running_network_menu = 0;
                     break;
@@ -1380,7 +1449,7 @@ void action_network_settings(void) {
     update_menu_display();
 }
 
-void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len) {
+void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len,char *if_str,size_t if_len) {
     struct ifaddrs *ifaddr, *ifa;
     int family, s;
     char host[NI_MAXHOST];
@@ -1389,6 +1458,7 @@ void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len
     // Initialize with defaults
     snprintf(ip_str, ip_len, "Not connected");
     snprintf(mac_str, mac_len, "Not available");
+    snprintf(if_str, if_len, "Not available");
 
     // Get IP address
     if (getifaddrs(&ifaddr) == -1) {
@@ -1423,7 +1493,9 @@ void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len
             continue;
         }
 
-        snprintf(ip_str, ip_len, "%s (%s)", host, ifa->ifa_name);
+        //snprintf(ip_str, ip_len, "%s (%s)", host, ifa->ifa_name);
+        snprintf(ip_str, ip_len, "%s", host);
+        snprintf(if_str, if_len, "%s", ifa->ifa_name);
         found_ip = true;
 
         // Try to get MAC address for the same interface
@@ -1436,7 +1508,7 @@ void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len
                 unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
                 snprintf(mac_str, mac_len, "%02X%02X%02X%02X%02X%02X",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-	    }
+        }
             close(fd);
         }
     }
@@ -1461,7 +1533,9 @@ void get_network_info(char *ip_str, size_t ip_len, char *mac_str, size_t mac_len
                     continue;
                 }
 
-                snprintf(ip_str, ip_len, "%s (lo)", host);
+                //snprintf(ip_str, ip_len, "%s (lo)", host);
+                snprintf(ip_str, ip_len, "%s", host);
+                snprintf(if_str, if_len, "lo");
 
                 // Try to get MAC for loopback too, though it likely won't have one
                 struct ifreq ifr;
@@ -1495,7 +1569,7 @@ void action_system_stats(void) {
     // Clear display and show initial system info
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    send_draw_text(0, 0, "System Stats");
+    send_draw_text(0, 0, "  System Stats");
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw a separator
@@ -1514,13 +1588,22 @@ void action_system_stats(void) {
     const int mem_bar_y = 51;//47;
 
     while (running_stats_menu && running) {
+        // Check for power save mode activation
+        if (power_save_enabled) {
+            check_power_save_timeout();
+            if (!display_powered_on || power_save_activated) {
+                DEBUG_PRINT("Power save detected - exiting\n");
+                running_stats_menu = 0;
+                break;
+            }
+        }
         // Check if device was disconnected
         if (device_disconnected) {
             DEBUG_PRINT("Device disconnected during system stats display\n");
             running_stats_menu = 0;
             break;
         }
-    	// Update stats every STAT_UPDATE_SEC seconds
+        // Update stats every STAT_UPDATE_SEC seconds
         struct timeval now;
         gettimeofday(&now, NULL);
         long time_diff_sec = (now.tv_sec - last_update.tv_sec);
@@ -1568,6 +1651,7 @@ void action_system_stats(void) {
 
             // Read events
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
+                update_activity_timestamp();
                 // Check for button press
                 if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
                     running_stats_menu = 0;
@@ -1719,7 +1803,7 @@ void action_test_internet(void) {
     // Clear display and show initial screen
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    send_draw_text(0, 0, "Internet Test");
+    send_draw_text(0, 0, " Internet Test");
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw a separator
@@ -1745,7 +1829,7 @@ void action_test_internet(void) {
         exit(ping_server(server, timeout_sec));
     } else if (child_pid < 0) {
         // Fork failed
-        send_draw_text(25, 50, "Test Error");
+        send_draw_text(25, 60, "Test Error");
         DEBUG_PRINT("Fork failed: %s\n", strerror(errno));
         sleep(2);
         update_menu_display();
@@ -1756,12 +1840,22 @@ void action_test_internet(void) {
     int running_test_menu = 1;
 
     while (running_test_menu && running) {
+        // Check for power save mode activation - ADD THIS BLOCK
+        if (power_save_enabled) {
+            check_power_save_timeout();
+            if (!display_powered_on || power_save_activated) {
+                DEBUG_PRINT("Power save detected - exiting\n");
+                running_test_menu = 0;
+                break;
+            }
+        }
+
         if (device_disconnected) {
             DEBUG_PRINT("Device disconnected during WiFi menu\n");
             running_test_menu = 0;
             break;
         }
-    	// Check if test has completed
+        // Check if test has completed
         if (!test_completed) {
             // Check if the child process has finished
             int status;
@@ -1781,11 +1875,11 @@ void action_test_internet(void) {
 
                 // Show result message
                 if (test_result == 0) {
-                    send_draw_text(0, 50, "                ");  // Clear line
-                    send_draw_text(30, 50, "Connected!");
+                    send_draw_text(0, 60, "                ");  // Clear line
+                    send_draw_text(30, 60, "Connected!");
                 } else {
-                    send_draw_text(0, 50, "                ");  // Clear line
-                    send_draw_text(20, 50, "No Connection");
+                    send_draw_text(0, 60, "                ");  // Clear line
+                    send_draw_text(20, 60, "No Connection");
                 }
             } else {
                 // Test still running, update progress bar
@@ -1827,6 +1921,7 @@ void action_test_internet(void) {
             struct input_event ev;
 
             while (read(input_fd, &ev, sizeof(ev)) > 0) {
+                update_activity_timestamp();
                 if (ev.type == EV_KEY && ev.code == BTN_LEFT && ev.value == 1) {
                     running_test_menu = 0;
                     break;
@@ -1913,7 +2008,7 @@ void action_wifi_menu(void) {
     // Clear display and show submenu
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    send_draw_text(0, 0, "WiFi Settings");
+    send_draw_text(0, 0, " WiFi Settings");
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw a separator
@@ -1961,7 +2056,13 @@ void action_wifi_menu(void) {
     struct timeval last_event_time = {0, 0};
 
     while (running_wifi_menu && running) {
-        // Check if device was disconnected
+    // Check if we should exit due to power save
+    if (exit_current_submenu||power_save_activated) {
+        DEBUG_PRINT("Power save detected - exiting\n");
+            running_wifi_menu = 0;
+            break;
+        }
+       // Check if device was disconnected
         if (device_disconnected) {
            DEBUG_PRINT("Device disconnected during WiFi menu\n");
            running_wifi_menu = 0;
@@ -2044,6 +2145,7 @@ void action_wifi_menu(void) {
             long time_since_last_ms = get_time_diff_ms(&last_event_time, &now);
 
             if (pending_movement && (paired_event_count >= 2 || time_since_last_ms > EVENT_PROCESS_THRESHOLD)) {
+                update_activity_timestamp();
                 // Only process if we have a non-zero total
                 if (total_rel_x != 0) {
                     // Remember old selection for redraw
@@ -2114,6 +2216,7 @@ void action_wifi_menu(void) {
             }
 
             if (btn_press) {
+                update_activity_timestamp();
                 // Handle button press based on selected option
                 if (selected_option == 2) {
                     // Exit option selected
@@ -2171,6 +2274,11 @@ void action_wifi_menu(void) {
 
         // Small delay to reduce CPU usage
         usleep(MAIN_LOOP_DELAY);
+
+    // Check power save timeout
+    if (power_save_enabled) {
+            check_power_save_timeout();
+    }
     }
 
     // Return to main menu
@@ -2258,7 +2366,21 @@ void detect_and_run(void) {
         send_clear();
         usleep(DISPLAY_CMD_DELAY * 15); // 150ms delay
 
-        // Now draw the menu
+    // Initialize the activity timestamp to the current time
+    gettimeofday(&last_activity_time, NULL);
+    DEBUG_PRINT("Activity timestamp initialized\n");
+    // If power save is enabled, ensure the display is powered on initially
+    if (power_save_enabled) {
+        display_powered_on = true;
+            // Send explicit power-on command to ensure hardware state matches our variable
+            unsigned char cmd[2];
+            cmd[0] = CMD_POWER_MODE;
+            cmd[1] = 0x01;  // Power ON
+            send_command(cmd, 2);
+        DEBUG_PRINT("Display power state initialized to ON\n");
+    }
+
+    // Now draw the menu
         update_menu_display();
 
         // Initialize timeval for key handling
@@ -2334,6 +2456,9 @@ void detect_and_run(void) {
             if (time_since_flush > CMD_BUFFER_FLUSH_INTERVAL && cmd_buffer.used > 0) {
                 flush_cmd_buffer();
             }
+
+        //check_power_save_timeout();
+        check_power_save_and_signal_exit();
 
             // Small delay to reduce CPU usage
             usleep(MAIN_LOOP_DELAY); // 5ms
@@ -2841,6 +2966,87 @@ bool check_device_present_silent(void) {
     return found;
 }
 
+// Function to set display power state
+void set_display_power(bool power_on) {
+    // Only send command if the state is changing
+    if (power_on == display_powered_on) {
+        return;
+    }
+
+    unsigned char cmd[2];
+    cmd[0] = CMD_POWER_MODE;
+    cmd[1] = power_on ? 0x01 : 0x00;
+
+    // Send the power command through serial
+    send_command(cmd, 2);
+
+    display_powered_on = power_on;
+
+    // Signal power save activation when turning off
+    if (!power_on) {
+        power_save_activated = true;
+        DEBUG_PRINT("Power save activated - signaling all menus to exit\n");
+    } else {
+        power_save_activated = false;
+    }
+
+    DEBUG_PRINT("Display power set to: %s\n", power_on ? "ON" : "OFF");
+
+    // If turning display back on, refresh the current menu
+    if (power_on) {
+        // Small delay to ensure display is ready
+        usleep(DISPLAY_CMD_DELAY * 5);
+        update_menu_display();
+    }
+}
+
+// Function to update the activity timestamp
+void update_activity_timestamp(void) {
+    gettimeofday(&last_activity_time, NULL);
+
+    // If the display was off, turn it back on
+    if (power_save_enabled && !display_powered_on) {
+        // Wake up display
+        set_display_power(true);
+
+        // Always return to main menu when waking up
+        // Exit any submenu if we're in one
+        // This would need custom handling in each submenu loop
+        // or a global flag to signal menu exit
+    }
+}
+
+// Function to check for power save timeout
+void check_power_save_timeout(void) {
+    if (!power_save_enabled || !display_powered_on) {
+        return;
+    }
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // Calculate time diff in seconds
+    long time_diff_sec = (now.tv_sec - last_activity_time.tv_sec);
+
+    if (time_diff_sec >= POWER_SAVE_TIMEOUT_SEC) {
+        DEBUG_PRINT("Power save timeout reached (%ld seconds of inactivity)\n", time_diff_sec);
+
+        // Turn off the display
+        set_display_power(false);
+        power_save_activated = true;
+    }
+}
+void check_power_save_and_signal_exit(void) {
+    // Check for power save timeout
+    if (power_save_enabled) {
+        check_power_save_timeout();
+
+        // If display turned off and we're in a submenu, signal it to exit
+        if (!display_powered_on && current_submenu_function != NULL) {
+            exit_current_submenu = true;
+        }
+    }
+}
 /* -----------------------------------------------------------------------------
  * Main function
  * -----------------------------------------------------------------------------*/
@@ -2855,7 +3061,7 @@ int main(int argc, char *argv[]) {
     bool args_provided = false;
 
     int opt;
-    while ((opt = getopt(argc, argv, "i:s:vah")) != -1) {
+    while ((opt = getopt(argc, argv, "i:s:vahp")) != -1) {
         switch (opt) {
             case 'i':
                 config.input_device = optarg;
@@ -2873,7 +3079,11 @@ int main(int argc, char *argv[]) {
                 printf("Auto-detection mode enabled\n");
                 detect_and_run();
                 return EXIT_SUCCESS;
-	    case 'h':
+        case 'p':
+                power_save_enabled = true;
+                printf("Power save mode enabled (timeout: %d seconds)\n", POWER_SAVE_TIMEOUT_SEC);
+                break;
+        case 'h':
                 print_usage(argv[0]);
                 return EXIT_SUCCESS;
             default:
@@ -2886,7 +3096,7 @@ int main(int argc, char *argv[]) {
     if (argc == 1 || !args_provided) {
         //print_usage(argv[0]);
         detect_and_run();
-	return EXIT_SUCCESS;
+    return EXIT_SUCCESS;
     }
 
     printf("Using input device: %s\n", config.input_device);
@@ -2978,6 +3188,9 @@ int main(int argc, char *argv[]) {
         if (time_since_flush > CMD_BUFFER_FLUSH_INTERVAL && cmd_buffer.used > 0) {
             flush_cmd_buffer();
         }
+
+    //check for powersave timeout
+    check_power_save_timeout();
 
         // Small delay to reduce CPU usage
         usleep(MAIN_LOOP_DELAY); // 5ms
