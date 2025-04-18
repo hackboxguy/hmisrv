@@ -2008,7 +2008,7 @@ void action_wifi_menu(void) {
     // Clear display and show submenu
     send_clear();
     usleep(DISPLAY_CMD_DELAY * 3);
-    send_draw_text(0, 0, " WiFi Settings");
+    send_draw_text(0, 0, "WiFi Settings");
     usleep(DISPLAY_CMD_DELAY);
 
     // Draw a separator
@@ -2176,7 +2176,7 @@ void action_wifi_menu(void) {
                                                      (i == 1 && !current_wifi_state);
 
                                 // Clear the line first to avoid display artifacts
-                                send_draw_text(0, y_pos, "                    ");
+                                send_draw_text(0, y_pos, "                ");
                                 usleep(DISPLAY_CMD_DELAY);
 
                                 // Format with selection indicator and/or inverse highlight
@@ -2237,7 +2237,7 @@ void action_wifi_menu(void) {
                             int y_pos = 16 + (i * 10);
 
                             // Clear the line first
-                            send_draw_text(0, y_pos, "                    ");
+                            send_draw_text(0, y_pos, "                ");
                             usleep(DISPLAY_CMD_DELAY);
 
                             // Determine state highlighting
